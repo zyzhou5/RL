@@ -1564,6 +1564,16 @@ def _should_use_async_rollouts(master_config: MasterConfig) -> bool:
     return False
 
 
+def _preserve_router_replay_routed_experts(
+    target: BatchedDataDict,
+    flat_messages: BatchedDataDict,
+    policy_config: PolicyConfig,
+) -> None:
+    """Carry rollout-recorded routes into policy worker inputs when R3 is enabled."""
+    if router_replay_enabled(policy_config) and "routed_experts" in flat_messages:
+        target["routed_experts"] = flat_messages["routed_experts"]
+
+
 def _should_use_nemo_gym(master_config: MasterConfig) -> bool:
     """Determine if NeMo-Gym should be used for rollouts and validation based on the configuration."""
     env_config = master_config.env
@@ -2383,11 +2393,9 @@ def grpo_train(
                     # but the train_data whitelist above drops it. Copy it back so
                     # the Megatron worker's train-stage router-replay guard finds
                     # it. Mirrors the TQ producer (sync_rollout_actor.py).
-                    if (
-                        router_replay_enabled(master_config.policy)
-                        and "routed_experts" in flat_messages
-                    ):
-                        train_data["routed_experts"] = flat_messages["routed_experts"]
+                    _preserve_router_replay_routed_experts(
+                        train_data, flat_messages, master_config.policy
+                    )
                     train_data.to("cpu")
 
                     metrics_logging_data["content"] = flat_messages["content"]
@@ -2438,11 +2446,9 @@ def grpo_train(
                     # intentionally ignores routed_experts (require_router_replay
                     # =False short-circuits before the field is read), so a
                     # present-but-unused field here is safe.
-                    if (
-                        router_replay_enabled(master_config.policy)
-                        and "routed_experts" in flat_messages
-                    ):
-                        logprob_data["routed_experts"] = flat_messages["routed_experts"]
+                    _preserve_router_replay_routed_experts(
+                        logprob_data, flat_messages, master_config.policy
+                    )
 
                     if not skip_prev_logprobs:
                         train_data["prev_logprobs"] = policy.get_logprobs(
@@ -3185,6 +3191,14 @@ def async_grpo_train(
     assert master_config.loss_fn.use_importance_sampling_correction, (
         "Importance sampling correction must be enabled for async GRPO for good convergence due to off-policy samples!"
     )
+    if router_replay_enabled(master_config.policy) and (
+        master_config.data_plane or {}
+    ).get("enabled", False):
+        raise NotImplementedError(
+            "policy.router_replay.enabled=true with async GRPO is currently "
+            "supported only when data_plane.enabled=false. Async + TQ support "
+            "has not been merged yet."
+        )
 
     if master_config.grpo["async_grpo"]["max_trajectory_age_steps"] > 1:
         if not master_config.grpo["async_grpo"].get("in_flight_weight_updates", False):
@@ -3610,6 +3624,9 @@ def async_grpo_train(
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
+                    )
+                    _preserve_router_replay_routed_experts(
+                        train_data, flat_messages, master_config.policy
                     )
                     train_data.to("cpu")
 
