@@ -1,0 +1,20 @@
+# Block JustGRPO-Fast on Nemotron-Labs-Diffusion-3B, 6x6 Sudoku (blanks reward, few-shot).
+# Inherits the Block JustGRPO sudoku6x6 config (block_size 16, sudoku data/env/reward,
+# 1536 seq) and turns on entropy-sparsified training: keep only the top-25% highest-entropy
+# within-block offsets (fast_entropy_level_ratio=0.25 -> m=ceil(0.25*16)=4 reveal levels /
+# forward passes instead of 16). Points the dLLM config at the return_entropy: true variant
+# so the SGLang server emits per-token entropy for the offset selection.
+defaults:
+  - grpo_sudoku6x6_block_just_grpo.yaml
+
+policy:
+  logprob_estimation:
+    fast_entropy_level_ratio: 0.25
+  generation:
+    sglang_cfg:
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-block-justgrpo-fast/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_entropy.yaml"
+
+logger:
+  log_dir: "logs/grpo-nd3b-block_just_grpo-fast-sudoku6x6-sglang"
+  wandb:
+    name: "grpo-nd3b-block_just_grpo-fast-sudoku6x6-blanks-fewshot"
