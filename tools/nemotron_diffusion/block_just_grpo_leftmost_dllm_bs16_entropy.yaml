@@ -1,0 +1,12 @@
+# Leftmost dLLM generation config for BlockJustGRPO-Fast at block_size=16, with
+# per-token entropy emission (return_entropy) enabled so the entropy-sparsified
+# trainer can rank within-block offsets. Identical to
+# block_just_grpo_leftmost_dllm_bs16.yaml except return_entropy: true.
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 16
+causal_context: true
+temperature: 1.0
+threshold: null
+selection_policy: leftmost
+return_entropy: true

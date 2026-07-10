@@ -6,9 +6,11 @@ from typing import Any, Optional
 
 import ray
 import torch
+from megatron.core import parallel_state
 
 from nemo_rl.algorithms.block_just_grpo_logprobs import (
     BlockJustGRPORevealSchedule,
+    build_block_kept_mask,
     build_block_reveal_base,
     get_block_reveal_logprob_estimation_cfg,
     make_reveal_level_view,
@@ -80,6 +82,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             include_loss=True,
             max_reveal_levels=cfg.get("max_reveal_levels"),
             reveal_tokens_per_level=reveal_k,
+            fast_entropy_level_ratio=cfg.get("fast_entropy_level_ratio"),
         )
         # One forward per reveal level; samples within a level are microbatched the
         # standard way by train_micro_batch_size (passed in as ``mbs``). A single
@@ -91,12 +94,35 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             harvest_keys=("diffu_grpo_score_mask", "diffu_grpo_loss_mask"),
             reveal_tokens_per_level=reveal_k,
         )
+        metadata: dict[str, Any] = {}
+        if "block_reveal_selected_offsets" in base:
+            # JustGRPO-Fast: normalize the loss by the kept-token count, not the
+            # full response length (only ~ratio of tokens are harvested).
+            metadata["fast_global_valid_toks"] = self._fast_global_valid_toks(
+                base, block_size
+            )
         return (
             schedule,
             self._cfg_for_diffu_grpo_sequence(base["input_ids"].shape[1]),
             mbs,
-            {},
+            metadata,
         )
+
+    def _fast_global_valid_toks(
+        self, base: BatchedDataDict[Any], block_size: int
+    ) -> torch.Tensor:
+        """DP-reduced count of tokens actually harvested under JustGRPO-Fast.
+
+        The union of the per-level harvest masks intersected with the score mask
+        -- exactly what the loss sums over -- reduced over the data-parallel group
+        like ``process_global_batch``'s token count so it stays DP-uniform.
+        """
+        local_kept = build_block_kept_mask(base, block_size).sum()
+        to_reduce = local_kept.detach().to(dtype=torch.float32).reshape(1).cuda()
+        torch.distributed.all_reduce(
+            to_reduce, group=parallel_state.get_data_parallel_group()
+        )
+        return to_reduce[0]
 
     # ---- logprobs: explicit for-loop over reveal levels ---------------------
     def get_logprobs(
@@ -123,6 +149,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             include_loss=False,
             max_reveal_levels=cfg.get("max_reveal_levels"),
             reveal_tokens_per_level=reveal_k,
+            fast_entropy_level_ratio=cfg.get("fast_entropy_level_ratio"),
         )
         original_seq_len = int(data["input_ids"].shape[1])
         if num_levels == 0:

@@ -32,6 +32,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GRPOAdvantageEstimator,
     ReinforcePlusPlusAdvantageEstimator,
 )
+from nemo_rl.algorithms.block_just_grpo_logprobs import require_generation_entropy
 from nemo_rl.algorithms.coupled_grpo_logprobs import maybe_set_coupled_grpo_seed
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
@@ -1950,6 +1951,14 @@ def grpo_train(
                         loss_multiplier[truncated] = 0
                         repeated_batch["loss_multiplier"] = loss_multiplier
                     # Add loss mask to each message in LLMMessageLogType
+                    _needs_generation_entropy = (
+                        (master_config["policy"].get("logprob_estimation") or {}).get(
+                            "fast_entropy_level_ratio"
+                        )
+                        is not None
+                    )
+                    if _needs_generation_entropy:
+                        require_generation_entropy(repeated_batch["message_log"])
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
@@ -1962,6 +1971,12 @@ def grpo_train(
                                 )
                             if "generation_logprobs" not in message:
                                 message["generation_logprobs"] = torch.zeros_like(
+                                    message["token_ids"], dtype=torch.float32
+                                )
+                            if _needs_generation_entropy and (
+                                "generation_entropy" not in message
+                            ):
+                                message["generation_entropy"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
 
@@ -1985,6 +2000,10 @@ def grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    if _needs_generation_entropy:
+                        train_data["generation_entropy"] = flat_messages[
+                            "generation_entropy"
+                        ]
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -3200,6 +3219,14 @@ def async_grpo_train(
                 # Prepare training data (same as sync version)
                 with timer.time("data_processing"):
                     # Add loss mask to each message
+                    _needs_generation_entropy = (
+                        (master_config["policy"].get("logprob_estimation") or {}).get(
+                            "fast_entropy_level_ratio"
+                        )
+                        is not None
+                    )
+                    if _needs_generation_entropy:
+                        require_generation_entropy(repeated_batch["message_log"])
                     for i, message_log in enumerate(repeated_batch["message_log"]):
                         for j, message in enumerate(message_log):
                             if message["role"] == "assistant":
@@ -3212,6 +3239,12 @@ def async_grpo_train(
                                 )
                             if "generation_logprobs" not in message:
                                 message["generation_logprobs"] = torch.zeros_like(
+                                    message["token_ids"], dtype=torch.float32
+                                )
+                            if _needs_generation_entropy and (
+                                "generation_entropy" not in message
+                            ):
+                                message["generation_entropy"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
 
@@ -3235,6 +3268,10 @@ def async_grpo_train(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    if _needs_generation_entropy:
+                        train_data["generation_entropy"] = flat_messages[
+                            "generation_entropy"
+                        ]
                     train_data.to("cpu")
 
                     # CoupledGRPO: async feeds train_data directly to prev/ref

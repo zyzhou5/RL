@@ -109,6 +109,10 @@ def generate_responses(
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
                 i, input_length:total_length
             ]
+        if "entropy" in generation_outputs:
+            assistant_message["generation_entropy"] = generation_outputs["entropy"][
+                i, input_length:total_length
+            ]
 
         batch["message_log"][i].append(assistant_message)
 
@@ -209,6 +213,10 @@ async def generate_responses_async(
 
         if include_logprobs and "logprobs" in generation_outputs:
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
+                i, input_length:total_length
+            ]
+        if "entropy" in generation_outputs:
+            assistant_message["generation_entropy"] = generation_outputs["entropy"][
                 i, input_length:total_length
             ]
 

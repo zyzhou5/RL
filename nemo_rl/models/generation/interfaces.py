@@ -213,6 +213,11 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    # Per-token entropy of the generation distribution, aligned/right-padded
+    # exactly like ``logprobs``. Emitted only by DLLM generation with entropy
+    # enabled (FastDiffuser return_entropy); consumed by the JustGRPO-Fast
+    # block-reveal estimator. Absent otherwise.
+    entropy: NotRequired[torch.Tensor]
     truncated: NotRequired[
         torch.Tensor
     ]  # Whether each sequence was truncated and hit max_tokens without stop token

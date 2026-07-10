@@ -48,6 +48,7 @@ per-level logprobs back to NemoRL's ``[N, S]`` layout.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any, Iterator
 
 import torch
@@ -104,6 +105,75 @@ def count_reveal_levels(
     return int(num_levels)
 
 
+def require_generation_entropy(message_logs: list[Any]) -> None:
+    """Fail fast when JustGRPO-Fast is active but generation produced no entropy.
+
+    ``fast_entropy_level_ratio`` ranks tokens by the SGLang rollout per-token
+    entropy. If the dLLM server ran with ``return_entropy: false`` the entropy
+    channel is absent and would otherwise be silently zero-filled -> sparsification
+    on a non-entropy signal. Raises unless at least one message carries a real
+    ``generation_entropy``.
+    """
+    has_entropy = any(
+        "generation_entropy" in message
+        for message_log in message_logs
+        for message in message_log
+    )
+    if not has_entropy:
+        raise ValueError(
+            "fast_entropy_level_ratio is set but the SGLang generation returned no "
+            "per-token entropy; enable return_entropy: true in the dLLM algorithm "
+            "config (FastDiffuser) so generation_entropy is produced."
+        )
+
+
+def build_block_topk_offsets(
+    entropy: torch.Tensor,
+    response_lengths: torch.Tensor,
+    completion_starts: torch.Tensor,
+    block_size: int,
+    m: int,
+) -> torch.Tensor:
+    """Per-(sample, block) top-``m`` highest-entropy within-block offsets.
+
+    ``entropy`` is the rollout per-token entropy in the original ``[N, S]``
+    layout (aligned to ``data['input_ids']`` exactly like ``generation_logprobs``);
+    ``completion_starts`` / ``response_lengths`` (from the block-reveal base) give
+    each sample's response span. Response token ``r`` lives in block
+    ``r // block_size`` at within-block offset ``r % block_size``; for each
+    (sample, block) the ``m`` valid offsets with highest entropy are kept and
+    returned **sorted ascending**. Blocks with fewer than ``m`` valid offsets
+    (partial trailing blocks) are padded with the sentinel ``-1``, which reveals
+    and harvests nothing in ``make_reveal_level_view``. Purely local per sample --
+    no all-reduce, since only the level count ``m`` (not the offsets) must be
+    DP-uniform, and it is a config-derived constant.
+    """
+    device = entropy.device
+    num_samples, seq_len = entropy.shape
+    response_lengths = response_lengths.to(device=device, dtype=torch.long)
+    completion_starts = completion_starts.to(device=device, dtype=torch.long)
+    k = int(block_size)
+    max_resp = int(response_lengths.max().item()) if num_samples else 0
+    num_blocks = max(1, (max_resp + k - 1) // k)
+
+    rel = torch.arange(num_blocks * k, device=device)  # response-relative index
+    valid = rel.unsqueeze(0) < response_lengths.unsqueeze(1)  # [N, num_blocks*k]
+    pos = (completion_starts.unsqueeze(1) + rel.unsqueeze(0)).clamp_(0, seq_len - 1)
+    gathered = entropy.gather(1, pos)
+    # Entropy is >= 0, so any negative fill ranks strictly below every valid
+    # offset in the top-``m`` and is recoverable as padding.
+    gathered = torch.where(valid, gathered, gathered.new_full((), -1.0))
+    grid = gathered.view(num_samples, num_blocks, k)  # [N, num_blocks, block_size]
+
+    topk_vals, topk_idx = torch.topk(grid, m, dim=-1)  # [N, num_blocks, m]
+    invalid = topk_vals < 0
+    # ``k`` sorts after every real offset (0..k-1); restored to sentinel -1 below.
+    sel = torch.where(invalid, torch.full_like(topk_idx, k), topk_idx)
+    sel, _ = torch.sort(sel, dim=-1)  # ascending; padded offsets land last
+    sel = torch.where(sel == k, torch.full_like(sel, -1), sel)
+    return sel.to(torch.long)
+
+
 def build_block_reveal_base(
     data: BatchedDataDict[Any],
     mask_token_id: int,
@@ -113,6 +183,7 @@ def build_block_reveal_base(
     include_loss: bool = False,
     max_reveal_levels: int | None = None,
     reveal_tokens_per_level: int = 1,
+    fast_entropy_level_ratio: float | None = None,
 ) -> tuple[BatchedDataDict[Any], int, int]:
     """Build the fully-masked completion ``base`` (N rows) + level count.
 
@@ -146,6 +217,32 @@ def build_block_reveal_base(
         max_reveal_levels,
         reveal_tokens_per_level=reveal_tokens_per_level,
     )
+    # JustGRPO-Fast: keep only the top-``ratio`` highest-entropy offsets per
+    # block. ``m`` is ``ceil(ratio * num_levels)`` -- a config-derived constant,
+    # so it stays DP-uniform like the full level count (no collective desync).
+    # ``ratio`` >= 1 (or None) leaves the full block untouched -> uniform reveal
+    # path -> byte-for-byte identical to base Block JustGRPO.
+    if fast_entropy_level_ratio is not None and int(reveal_tokens_per_level) != 1:
+        # Fast reveal is width-1 per selected offset and ignores k, so with k > 1 it
+        # would reveal same-step neighbors that were masked during generation ->
+        # wrong conditioning. Disallow the combination outright.
+        raise ValueError(
+            "JustGRPO-Fast entropy sparsification (fast_entropy_level_ratio) "
+            "currently supports reveal_tokens_per_level == 1 only; got "
+            f"k={int(reveal_tokens_per_level)}."
+        )
+    if fast_entropy_level_ratio is not None and num_levels > 0:
+        m = max(1, math.ceil(float(fast_entropy_level_ratio) * num_levels))
+        if m < num_levels:
+            entropy = data["generation_entropy"].to(base["input_ids"].device)
+            base["block_reveal_selected_offsets"] = build_block_topk_offsets(
+                entropy=entropy,
+                response_lengths=base["diffu_grpo_response_lengths"],
+                completion_starts=base["diffu_grpo_completion_starts"],
+                block_size=block_size,
+                m=m,
+            )
+            num_levels = m
     return base, num_samples, num_levels
 
 
@@ -180,20 +277,47 @@ def make_reveal_level_view(
     within_block_off = torch.remainder(rel.clamp_min(0), int(block_size))
     in_response = (rel >= 0) & (rel < response_lengths.unsqueeze(1))
 
-    k = max(1, int(reveal_tokens_per_level))
-    reveal_upto = level * k
-    reveal = in_response & (within_block_off < reveal_upto)
+    selected = base.get("block_reveal_selected_offsets", None)
+    if selected is None:
+        # Uniform reveal (default / full block): every block reveals its first
+        # ``level * k`` tokens and harvests the length-``k`` window after them.
+        k = max(1, int(reveal_tokens_per_level))
+        reveal_upto = level * k
+        reveal = in_response & (within_block_off < reveal_upto)
+        harvest = (
+            in_response
+            & (within_block_off >= reveal_upto)
+            & (within_block_off < reveal_upto + k)
+            & (score_mask > 0.5)
+        )
+    else:
+        # JustGRPO-Fast: at rank ``level`` each block reveals its own selected
+        # prefix ``0..o-1`` and harvests exactly its ``level``-th kept offset
+        # ``o`` (sentinel -1 reveals/harvests nothing). Conditioning is
+        # byte-identical to the full block-reveal view at absolute level ``o``, so
+        # each kept token's logprob is unchanged; only which offsets enter the
+        # loss differs.
+        selected = selected.to(device=device)
+        num_blocks = selected.shape[1]
+        block_idx = torch.div(
+            rel.clamp_min(0), int(block_size), rounding_mode="floor"
+        ).clamp_(0, num_blocks - 1)
+        block_idx = block_idx.expand(num_samples, -1)
+        reveal_upto = torch.gather(selected[:, :, level], 1, block_idx)
+        reveal = in_response & (within_block_off < reveal_upto)
+        harvest = (
+            in_response & (within_block_off == reveal_upto) & (score_mask > 0.5)
+        )
     ids = torch.where(reveal, target_ids, base["input_ids"].to(device))
-    harvest = (
-        in_response
-        & (within_block_off >= reveal_upto)
-        & (within_block_off < reveal_upto + k)
-        & (score_mask > 0.5)
-    ).to(dtype=score_mask.dtype)
+    harvest = harvest.to(dtype=score_mask.dtype)
 
     view = BatchedDataDict[Any]()
     for key, value in base.items():
         view[key] = value
+    # The [N, num_blocks, m] selection tensor is only needed to build this view;
+    # keep it out of the emitted microbatch, which carries 2-D [N, S] fields.
+    if "block_reveal_selected_offsets" in view:
+        del view["block_reveal_selected_offsets"]
     view["input_ids"] = ids
     for key in harvest_keys:
         view[key] = harvest
@@ -206,6 +330,47 @@ def make_reveal_level_view(
         num_samples, device=device, dtype=torch.long
     )
     return view
+
+
+def build_block_kept_mask(
+    base: BatchedDataDict[Any],
+    block_size: int,
+) -> torch.Tensor:
+    """The ``[N, total_len]`` mask of tokens harvested across all Fast reveal levels.
+
+    Equals the union of the ``m`` per-level harvest masks -- each selected offset is
+    harvested at exactly one level, so the union is also their sum -- intersected with
+    the score mask. Used to normalize the JustGRPO-Fast loss by the *kept* token count
+    rather than the full response length. Requires ``block_reveal_selected_offsets`` on
+    ``base`` (Fast path only). Mirrors ``make_reveal_level_view``'s harvest primitives
+    so the two cannot drift.
+    """
+    device = base["input_ids"].device
+    selected = base["block_reveal_selected_offsets"].to(device)
+    num_samples, total_len = base["input_ids"].shape
+    score_mask = base["diffu_grpo_score_mask"].to(device)
+    response_lengths = base["diffu_grpo_response_lengths"].to(device)
+    noisy_offset = (
+        int(base["diffu_grpo_noisy_response_offsets"][0].item())
+        if num_samples
+        else 0
+    )
+    col = torch.arange(total_len, device=device).unsqueeze(0)
+    rel = col - noisy_offset
+    within_block_off = torch.remainder(rel.clamp_min(0), int(block_size))
+    in_response = (rel >= 0) & (rel < response_lengths.unsqueeze(1))
+    num_blocks = selected.shape[1]
+    block_idx = (
+        torch.div(rel.clamp_min(0), int(block_size), rounding_mode="floor")
+        .clamp_(0, num_blocks - 1)
+        .expand(num_samples, -1)
+    )
+    kept = torch.zeros_like(in_response)
+    for j in range(selected.shape[2]):
+        sel_j = torch.gather(selected[:, :, j], 1, block_idx)
+        kept = kept | (within_block_off == sel_j)
+    kept = in_response & kept & (score_mask > 0.5)
+    return kept.to(dtype=score_mask.dtype)
 
 
 class BlockJustGRPORevealSchedule(BatchedDataDict[Any]):

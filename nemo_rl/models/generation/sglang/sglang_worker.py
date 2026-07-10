@@ -128,6 +128,24 @@ def _extract_generated_tokens_and_logprobs(
     return [], []
 
 
+def _extract_generation_entropy(
+    result: dict[str, Any], num_tokens: int
+) -> list[float]:
+    """Extract per-token generation entropy from an SGLang /generate response.
+
+    Emitted only when the DLLM server runs with ``return_entropy`` (FastDiffuser);
+    absent otherwise. Returns ``[]`` when unavailable or length-mismatched, so the
+    caller omits the entropy channel entirely and the default path is unchanged.
+    """
+    meta_info = result.get("meta_info", {})
+    entropy = meta_info.get(
+        "output_token_entropy_val", result.get("output_token_entropy_val", [])
+    )
+    if not entropy or len(entropy) != num_tokens:
+        return []
+    return [float(x) for x in entropy]
+
+
 def _require_sglang():
     """Import `sglang` lazily so test collection works without the optional extra."""
     try:
@@ -566,7 +584,7 @@ class SGLangGenerationWorker:
         input_ids: list[int],
         sampling_params: dict[str, Any],
         stop_string: Optional[str] = None,
-    ) -> tuple[list[int], list[float]]:
+    ) -> tuple[list[int], list[float], list[float]]:
         """Generate a single sample using SGLang API (async function).
 
         Args:
@@ -625,7 +643,9 @@ class SGLangGenerationWorker:
                 )
                 raise
 
-        return _extract_generated_tokens_and_logprobs(result)
+        tokens, logprobs = _extract_generated_tokens_and_logprobs(result)
+        entropy = _extract_generation_entropy(result, len(tokens))
+        return tokens, logprobs, entropy
 
     async def _generate_async(self, tasks):
         """Execute generation tasks with concurrency control.
@@ -785,7 +805,7 @@ class SGLangGenerationWorker:
         except Exception as e:
             raise
 
-        total_generated_tokens = sum(len(tokens) for tokens, _ in all_results)
+        total_generated_tokens = sum(len(tokens) for tokens, _, _ in all_results)
         avg_generation_length = (
             total_generated_tokens / batch_size if batch_size > 0 else 0
         )
@@ -793,12 +813,14 @@ class SGLangGenerationWorker:
         # Process results
         output_ids_list = []
         logprobs_list = []
+        entropy_list = []
+        any_entropy = False
         generation_lengths_list = []
         unpadded_sequence_lengths_list = []
         max_length = 0
 
         # First pass: calculate max_length
-        for i, (new_tokens, new_logprobs) in enumerate(all_results):
+        for i, (new_tokens, new_logprobs, new_entropy) in enumerate(all_results):
             input_len = input_lengths[i].item()
             generation_length = len(new_tokens)
             unpadded_length = input_len + generation_length
@@ -806,7 +828,7 @@ class SGLangGenerationWorker:
 
         total_length = max(max_length, padded_input_length)
 
-        for i, (new_tokens, new_logprobs) in enumerate(all_results):
+        for i, (new_tokens, new_logprobs, new_entropy) in enumerate(all_results):
             input_len = input_lengths[i].item()
             generation_length = len(new_tokens)
             unpadded_length = input_len + generation_length
@@ -829,8 +851,16 @@ class SGLangGenerationWorker:
                     position = input_len + idx
                     full_logprobs[position] = logprob
 
+            # Entropy channel (only populated when the server emits it).
+            full_entropy = torch.zeros(total_length, dtype=torch.float32)
+            if new_entropy:
+                any_entropy = True
+                for idx, ent in enumerate(new_entropy):
+                    full_entropy[input_len + idx] = ent
+
             output_ids_list.append(full_output)
             logprobs_list.append(full_logprobs)
+            entropy_list.append(full_entropy)
             generation_lengths_list.append(generation_length)
             unpadded_sequence_lengths_list.append(unpadded_length)
 
@@ -844,7 +874,7 @@ class SGLangGenerationWorker:
         logger.debug(
             f"[SGLang Worker] Rank {self.global_rank} Generated {total_generated_tokens} tokens across {batch_size} samples (avg: {avg_generation_length:.1f} tokens/sample)"
         )
-        return BatchedDataDict[GenerationOutputSpec](
+        output_batch = BatchedDataDict[GenerationOutputSpec](
             {
                 "output_ids": output_ids,
                 "generation_lengths": generation_lengths,
@@ -852,6 +882,9 @@ class SGLangGenerationWorker:
                 "logprobs": logprobs,
             }
         )
+        if any_entropy:
+            output_batch["entropy"] = torch.stack(entropy_list)
+        return output_batch
 
     def sleep(self):
         """Release SGLang GPU memory (weights + KV cache) for the training phase.
