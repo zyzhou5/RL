@@ -184,7 +184,7 @@ def build_block_reveal_base(
     max_reveal_levels: int | None = None,
     reveal_tokens_per_level: int = 1,
     fast_entropy_level_ratio: float | None = None,
-) -> tuple[BatchedDataDict[Any], int, int]:
+) -> tuple[BatchedDataDict[Any], int, int, torch.Tensor | None]:
     """Build the fully-masked completion ``base`` (N rows) + level count.
 
     The noisy side is *not* block-padded (``block_size=None`` is forwarded to the
@@ -192,7 +192,10 @@ def build_block_reveal_base(
     response token -- matching the per-token leftmost-reveal attention length.
     Block structure for the attention mask comes from the model module's
     ``block_size``, not from noisy padding. Returns ``(base, num_samples,
-    num_levels)``.
+    num_levels, selected_offsets)`` -- ``selected_offsets`` is the ``[N,
+    num_blocks, m]`` Fast selection tensor, kept OFF the base data-dict (it is
+    not a per-sequence tensor and would fail Megatron's seqlen validation), and
+    is ``None`` unless the Fast path is active.
     """
     if include_loss:
         base = build_fully_masked_completion_loss_batch(
@@ -217,6 +220,7 @@ def build_block_reveal_base(
         max_reveal_levels,
         reveal_tokens_per_level=reveal_tokens_per_level,
     )
+    selected_offsets: torch.Tensor | None = None
     # JustGRPO-Fast: keep only the top-``ratio`` highest-entropy offsets per
     # block. ``m`` is ``ceil(ratio * num_levels)`` -- a config-derived constant,
     # so it stays DP-uniform like the full level count (no collective desync).
@@ -241,7 +245,7 @@ def build_block_reveal_base(
                     "it was not threaded in (see grpo.py logprob_data construction)."
                 )
             entropy = data["generation_entropy"].to(base["input_ids"].device)
-            base["block_reveal_selected_offsets"] = build_block_topk_offsets(
+            selected_offsets = build_block_topk_offsets(
                 entropy=entropy,
                 response_lengths=base["diffu_grpo_response_lengths"],
                 completion_starts=base["diffu_grpo_completion_starts"],
@@ -249,7 +253,7 @@ def build_block_reveal_base(
                 m=m,
             )
             num_levels = m
-    return base, num_samples, num_levels
+    return base, num_samples, num_levels, selected_offsets
 
 
 def make_reveal_level_view(
@@ -258,6 +262,7 @@ def make_reveal_level_view(
     block_size: int,
     harvest_keys: tuple[str, ...],
     reveal_tokens_per_level: int = 1,
+    selected_offsets: torch.Tensor | None = None,
 ) -> BatchedDataDict[Any]:
     """Derive the reveal-level-``level`` view (N rows) from a fully-masked base.
 
@@ -283,7 +288,7 @@ def make_reveal_level_view(
     within_block_off = torch.remainder(rel.clamp_min(0), int(block_size))
     in_response = (rel >= 0) & (rel < response_lengths.unsqueeze(1))
 
-    selected = base.get("block_reveal_selected_offsets", None)
+    selected = selected_offsets
     if selected is None:
         # Uniform reveal (default / full block): every block reveals its first
         # ``level * k`` tokens and harvests the length-``k`` window after them.
@@ -320,10 +325,6 @@ def make_reveal_level_view(
     view = BatchedDataDict[Any]()
     for key, value in base.items():
         view[key] = value
-    # The [N, num_blocks, m] selection tensor is only needed to build this view;
-    # keep it out of the emitted microbatch, which carries 2-D [N, S] fields.
-    if "block_reveal_selected_offsets" in view:
-        del view["block_reveal_selected_offsets"]
     view["input_ids"] = ids
     for key in harvest_keys:
         view[key] = harvest
@@ -340,6 +341,7 @@ def make_reveal_level_view(
 
 def build_block_kept_mask(
     base: BatchedDataDict[Any],
+    selected_offsets: torch.Tensor,
     block_size: int,
 ) -> torch.Tensor:
     """The ``[N, total_len]`` mask of tokens harvested across all Fast reveal levels.
@@ -348,11 +350,12 @@ def build_block_kept_mask(
     harvested at exactly one level, so the union is also their sum -- intersected with
     the score mask. Used to normalize the JustGRPO-Fast loss by the *kept* token count
     rather than the full response length. Requires ``block_reveal_selected_offsets`` on
-    ``base`` (Fast path only). Mirrors ``make_reveal_level_view``'s harvest primitives
+    ``base`` (Fast path only). ``selected_offsets`` is the ``[N, num_blocks, m]``
+    Fast selection tensor. Mirrors ``make_reveal_level_view``'s harvest primitives
     so the two cannot drift.
     """
     device = base["input_ids"].device
-    selected = base["block_reveal_selected_offsets"].to(device)
+    selected = selected_offsets.to(device)
     num_samples, total_len = base["input_ids"].shape
     score_mask = base["diffu_grpo_score_mask"].to(device)
     response_lengths = base["diffu_grpo_response_lengths"].to(device)
@@ -401,11 +404,13 @@ class BlockJustGRPORevealSchedule(BatchedDataDict[Any]):
         block_size: int,
         harvest_keys: tuple[str, ...],
         reveal_tokens_per_level: int = 1,
+        selected_offsets: torch.Tensor | None = None,
     ) -> "BlockJustGRPORevealSchedule":
         self._br_num_levels = int(num_levels)
         self._br_block_size = int(block_size)
         self._br_harvest_keys = tuple(harvest_keys)
         self._br_reveal_tokens_per_level = max(1, int(reveal_tokens_per_level))
+        self._br_selected_offsets = selected_offsets
         return self
 
     def _sample_count(self) -> int:
@@ -431,6 +436,7 @@ class BlockJustGRPORevealSchedule(BatchedDataDict[Any]):
                 self._br_block_size,
                 self._br_harvest_keys,
                 self._br_reveal_tokens_per_level,
+                selected_offsets=self._br_selected_offsets,
             )
             # Sample microbatching is the standard BatchedDataDict mechanism.
             yield from level_view.make_microbatch_iterator(microbatch_size)

@@ -65,7 +65,7 @@ def _make_data() -> BatchedDataDict:
 
 def test_reveal_pattern_and_harvest_partition():
     data = _make_data()
-    base, N, num_levels = build_block_reveal_base(
+    base, N, num_levels, _selected = build_block_reveal_base(
         data, mask_token_id=MASK, pad_token_id=PAD, block_size=BLOCK, include_loss=False
     )
     assert N == 2 and num_levels == 4
@@ -93,7 +93,7 @@ def test_reveal_k_levels_partition_and_scatter():
     windows still partition the response exactly once, and scatter round-trips."""
     data = _make_data()
     for k, expect_levels in ((1, 4), (2, 2), (3, 2), (4, 1)):
-        base, N, num_levels = build_block_reveal_base(
+        base, N, num_levels, _selected = build_block_reveal_base(
             data,
             mask_token_id=MASK,
             pad_token_id=PAD,
@@ -145,7 +145,7 @@ def test_reveal_k_levels_partition_and_scatter():
 
 def test_scatter_roundtrip():
     data = _make_data()
-    base, N, num_levels = build_block_reveal_base(
+    base, N, num_levels, _selected = build_block_reveal_base(
         data, mask_token_id=MASK, pad_token_id=PAD, block_size=BLOCK, include_loss=False
     )
     noisy_len = int(base["diffu_grpo_noisy_lengths"][0].item())
@@ -180,7 +180,7 @@ def test_loss_view():
     data["advantages"] = torch.arange(N * S, dtype=torch.float32).reshape(N, S)
     data["prev_logprobs"] = torch.zeros(N, S)
     data["generation_logprobs"] = torch.zeros(N, S)
-    base, _, num_levels = build_block_reveal_base(
+    base, _, num_levels, _selected = build_block_reveal_base(
         data, mask_token_id=MASK, pad_token_id=PAD, block_size=BLOCK, include_loss=True
     )
     noisy_len = int(base["diffu_grpo_noisy_lengths"][0].item())
@@ -206,7 +206,7 @@ def test_reveal_schedule():
     data["advantages"] = torch.arange(N * S, dtype=torch.float32).reshape(N, S)
     data["prev_logprobs"] = torch.zeros(N, S)
     data["generation_logprobs"] = torch.zeros(N, S)
-    base, n, num_levels = build_block_reveal_base(
+    base, n, num_levels, _selected = build_block_reveal_base(
         data, mask_token_id=MASK, pad_token_id=PAD, block_size=BLOCK, include_loss=True
     )
     schedule = BlockJustGRPORevealSchedule(base).configure(
@@ -250,7 +250,7 @@ def test_build_block_topk_offsets():
     """Top-``m`` offsets per (sample, block): correct picks, ascending sort, and
     sentinel -1 padding for partial trailing blocks."""
     data = _make_entropy_data()
-    base, N, _ = build_block_reveal_base(
+    base, N, _, _selected = build_block_reveal_base(
         data, mask_token_id=MASK, pad_token_id=PAD, block_size=BLOCK, include_loss=False
     )
     sel = build_block_topk_offsets(
@@ -278,7 +278,7 @@ def test_fast_within_block_reveal_exactness():
     full block-reveal view at absolute level ``o``. Sentinel offsets reveal and
     harvest nothing, and the 3-D selection tensor is stripped from the view."""
     data = _make_entropy_data()
-    base, N, num_levels = build_block_reveal_base(
+    base, N, num_levels, selected = build_block_reveal_base(
         data,
         mask_token_id=MASK,
         pad_token_id=PAD,
@@ -287,12 +287,11 @@ def test_fast_within_block_reveal_exactness():
         fast_entropy_level_ratio=0.5,
     )
     assert num_levels == 2  # ceil(0.5 * 4)
-    selected = base["block_reveal_selected_offsets"]
     resp = base["diffu_grpo_response_lengths"]
     noisy_len = int(base["diffu_grpo_noisy_lengths"][0].item())
     cover = torch.zeros(N, noisy_len)
     for j in range(num_levels):
-        view = make_reveal_level_view(base, j, BLOCK, SCORE)
+        view = make_reveal_level_view(base, j, BLOCK, SCORE, selected_offsets=selected)
         assert "block_reveal_selected_offsets" not in view
         target = view["diffu_grpo_target_ids"]
         harvest = view["block_reveal_harvest_mask"]
@@ -320,10 +319,10 @@ def test_fast_ratio_one_parity():
     attached and every reveal-level view is byte-for-byte identical to the full
     Block JustGRPO path."""
     data = _make_entropy_data()
-    base_full, _, nl_full = build_block_reveal_base(
+    base_full, _, nl_full, sel_full = build_block_reveal_base(
         data, mask_token_id=MASK, pad_token_id=PAD, block_size=BLOCK, include_loss=True
     )
-    base_one, _, nl_one = build_block_reveal_base(
+    base_one, _, nl_one, sel_one = build_block_reveal_base(
         data,
         mask_token_id=MASK,
         pad_token_id=PAD,
@@ -332,7 +331,7 @@ def test_fast_ratio_one_parity():
         fast_entropy_level_ratio=1.0,
     )
     assert nl_one == nl_full
-    assert "block_reveal_selected_offsets" not in base_one
+    assert sel_full is None and sel_one is None  # ratio>=1 -> uniform, no selection
     for j in range(nl_full):
         vf = make_reveal_level_view(base_full, j, BLOCK, LOSS)
         vo = make_reveal_level_view(base_one, j, BLOCK, LOSS)
@@ -346,7 +345,7 @@ def test_fast_kept_mask_matches_per_level_harvest_and_is_sparse():
     loss normalizer must use this count, not the full ``token_mask`` count (which is the
     bug this guards)."""
     data = _make_entropy_data()
-    base, N, num_levels = build_block_reveal_base(
+    base, N, num_levels, selected = build_block_reveal_base(
         data,
         mask_token_id=MASK,
         pad_token_id=PAD,
@@ -358,9 +357,11 @@ def test_fast_kept_mask_matches_per_level_harvest_and_is_sparse():
     # Independent reference: sum the actual per-level harvest masks the loss sees.
     per_level_sum = None
     for j in range(num_levels):
-        h = make_reveal_level_view(base, j, BLOCK, SCORE)["block_reveal_harvest_mask"]
+        h = make_reveal_level_view(base, j, BLOCK, SCORE, selected_offsets=selected)[
+            "block_reveal_harvest_mask"
+        ]
         per_level_sum = h if per_level_sum is None else per_level_sum + h
-    kept = build_block_kept_mask(base, BLOCK)
+    kept = build_block_kept_mask(base, selected, BLOCK)
     assert torch.equal(kept, per_level_sum)  # per-level harvests are disjoint (0/1)
     kept_count = float(kept.sum())
     full_count = float(base["diffu_grpo_score_mask"].sum())  # full response tokens
@@ -383,7 +384,7 @@ def test_fast_requires_reveal_tokens_per_level_one():
             reveal_tokens_per_level=2,
         )
     # k>1 without Fast stays allowed.
-    _base, _n, levels = build_block_reveal_base(
+    _base, _n, levels, _selected = build_block_reveal_base(
         data,
         mask_token_id=MASK,
         pad_token_id=PAD,
@@ -404,3 +405,38 @@ def test_require_generation_entropy_raises_when_channel_absent():
     without_entropy = [[{"role": "user"}, {"role": "assistant"}]]
     with pytest.raises(ValueError, match="return_entropy: true"):
         require_generation_entropy(without_entropy)
+
+
+def test_fast_training_schedule_has_no_nonsequence_tensors():
+    """Regression: the Fast training schedule's data-dict must hold only ``[B, S]`` /
+    ``[B]`` tensors. The 3-D selection tensor must NOT ride inside the validated
+    container -- otherwise ``get_and_validate_seqlen`` (run on the whole schedule
+    before the per-level views are materialized) asserts on its dim-1."""
+    data = _make_entropy_data()
+    N, S = data["input_ids"].shape
+    data["advantages"] = torch.arange(N * S, dtype=torch.float32).reshape(N, S)
+    data["prev_logprobs"] = torch.zeros(N, S)
+    data["generation_logprobs"] = torch.zeros(N, S)
+    base, _n, num_levels, selected = build_block_reveal_base(
+        data,
+        mask_token_id=MASK,
+        pad_token_id=PAD,
+        block_size=BLOCK,
+        include_loss=True,
+        fast_entropy_level_ratio=0.5,
+    )
+    assert selected is not None and selected.ndim == 3  # [N, num_blocks, m]
+    schedule = BlockJustGRPORevealSchedule(base).configure(
+        num_levels=num_levels,
+        block_size=BLOCK,
+        harvest_keys=LOSS,
+        selected_offsets=selected,
+    )
+    for key, value in schedule.data.items():
+        if torch.is_tensor(value):
+            assert value.ndim <= 2, (key, tuple(value.shape))
+    # The emitted per-level microbatches are also clean [B, S] / [B].
+    for mb in schedule.make_microbatch_iterator(1):
+        for key, value in mb.data.items():
+            if torch.is_tensor(value):
+                assert value.ndim <= 2, (key, tuple(value.shape))

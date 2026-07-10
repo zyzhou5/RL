@@ -73,7 +73,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         block_size = self._block_reveal_block_size()
         reveal_k = self._block_reveal_tokens_per_level()
         self._maybe_print_diffusion_block_size("block_reveal_train", block_size)
-        base, _num_samples, num_levels = build_block_reveal_base(
+        base, _num_samples, num_levels, selected_offsets = build_block_reveal_base(
             data,
             mask_token_id=cfg["mask_token_id"],
             pad_token_id=self.tokenizer.pad_token_id,
@@ -93,13 +93,14 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             block_size=block_size,
             harvest_keys=("diffu_grpo_score_mask", "diffu_grpo_loss_mask"),
             reveal_tokens_per_level=reveal_k,
+            selected_offsets=selected_offsets,
         )
         metadata: dict[str, Any] = {}
-        if "block_reveal_selected_offsets" in base:
+        if selected_offsets is not None:
             # JustGRPO-Fast: normalize the loss by the kept-token count, not the
             # full response length (only ~ratio of tokens are harvested).
             metadata["fast_global_valid_toks"] = self._fast_global_valid_toks(
-                base, block_size
+                base, selected_offsets, block_size
             )
         return (
             schedule,
@@ -109,7 +110,10 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         )
 
     def _fast_global_valid_toks(
-        self, base: BatchedDataDict[Any], block_size: int
+        self,
+        base: BatchedDataDict[Any],
+        selected_offsets: torch.Tensor,
+        block_size: int,
     ) -> torch.Tensor:
         """DP-reduced count of tokens actually harvested under JustGRPO-Fast.
 
@@ -117,7 +121,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         -- exactly what the loss sums over -- reduced over the data-parallel group
         like ``process_global_batch``'s token count so it stays DP-uniform.
         """
-        local_kept = build_block_kept_mask(base, block_size).sum()
+        local_kept = build_block_kept_mask(base, selected_offsets, block_size).sum()
         to_reduce = local_kept.detach().to(dtype=torch.float32).reshape(1).cuda()
         torch.distributed.all_reduce(
             to_reduce, group=parallel_state.get_data_parallel_group()
@@ -140,7 +144,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             if micro_batch_size is not None
             else self.cfg["logprob_batch_size"]
         )
-        base, num_samples, num_levels = build_block_reveal_base(
+        base, num_samples, num_levels, selected_offsets = build_block_reveal_base(
             data,
             mask_token_id=cfg["mask_token_id"],
             pad_token_id=self.tokenizer.pad_token_id,
@@ -160,6 +164,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
         # forward; its scattered logprobs land at that level's harvested positions
         # (zero elsewhere). Summing across levels yields the full [N, S] logprobs.
         self._br_base = base
+        self._br_selected_offsets = selected_offsets
         self._br_block_size_cur = block_size
         self._br_reveal_k = reveal_k
         self._br_reveal_mbs = reveal_mbs
@@ -198,6 +203,7 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             self._br_block_size_cur,
             ("diffu_grpo_score_mask",),
             self._br_reveal_k,
+            selected_offsets=self._br_selected_offsets,
         )
         level_mbs = (
             micro_batch_size if micro_batch_size is not None else self._br_reveal_mbs
