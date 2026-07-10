@@ -429,6 +429,12 @@ class DiffusionMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl, ABC):
                 )
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
+                # JustGRPO-Fast trains on only the kept (top-entropy) tokens; the block
+                # worker supplies the matching DP-reduced kept-token count so the loss
+                # normalizer (and the logged metric) count the harvested set, not the
+                # full response. All other variants return no such key -> unchanged.
+                if "fast_global_valid_toks" in _metadata:
+                    global_valid_toks = _metadata["fast_global_valid_toks"]
                 # Scale the loss normalizer when the training schedule accumulates each
                 # token / sequence more than once per step (CoupledGRPO with K>1 coupled
                 # pairs). Only the counts passed to forward/backward are scaled; the

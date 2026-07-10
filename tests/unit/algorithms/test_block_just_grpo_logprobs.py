@@ -24,10 +24,15 @@ from __future__ import annotations
 
 import torch
 
+import pytest
+
 from nemo_rl.algorithms.block_just_grpo_logprobs import (
     BlockJustGRPORevealSchedule,
+    build_block_kept_mask,
     build_block_reveal_base,
+    build_block_topk_offsets,
     make_reveal_level_view,
+    require_generation_entropy,
     scatter_block_reveal_logprobs,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -219,3 +224,183 @@ def test_reveal_schedule():
         )
         assert torch.equal(got, ref), key
 
+
+# --------------------------------------------------------------------------- #
+# JustGRPO-Fast: entropy-sparsified block-reveal (fast_entropy_level_ratio)
+# --------------------------------------------------------------------------- #
+def _make_entropy_data() -> BatchedDataDict:
+    """``_make_data`` plus a rollout entropy signal: within-block offset value.
+
+    entropy[response_token r] = r % BLOCK, so the top-``m`` offsets per block are
+    deterministically the ``m`` largest within-block offsets (easy to assert).
+    """
+    data = _make_data()
+    N, S = data["input_ids"].shape
+    entropy = torch.zeros(N, S)
+    tm = data["token_mask"]
+    for s in range(N):
+        idx = torch.nonzero(tm[s] > 0.5, as_tuple=False).flatten().tolist()
+        for rel, pos in enumerate(idx):
+            entropy[s, pos] = float(rel % BLOCK)
+    data["generation_entropy"] = entropy
+    return data
+
+
+def test_build_block_topk_offsets():
+    """Top-``m`` offsets per (sample, block): correct picks, ascending sort, and
+    sentinel -1 padding for partial trailing blocks."""
+    data = _make_entropy_data()
+    base, N, _ = build_block_reveal_base(
+        data, mask_token_id=MASK, pad_token_id=PAD, block_size=BLOCK, include_loss=False
+    )
+    sel = build_block_topk_offsets(
+        entropy=data["generation_entropy"],
+        response_lengths=base["diffu_grpo_response_lengths"],
+        completion_starts=base["diffu_grpo_completion_starts"],
+        block_size=BLOCK,
+        m=2,
+    )
+    # sample 0 (resp 11): 3 blocks, last partial (offsets 0,1,2 valid).
+    # sample 1 (resp 5): block0 full, block1 has only offset 0, block2 empty.
+    expected = torch.tensor(
+        [
+            [[2, 3], [2, 3], [1, 2]],
+            [[2, 3], [0, -1], [-1, -1]],
+        ]
+    )
+    assert sel.shape == (2, 3, 2)
+    assert torch.equal(sel, expected), sel
+
+
+def test_fast_within_block_reveal_exactness():
+    """Each kept offset ``o`` (rank ``j``) reveals its own block prefix ``0..o-1``
+    and harvests exactly ``o`` -- byte-identical within-block conditioning to the
+    full block-reveal view at absolute level ``o``. Sentinel offsets reveal and
+    harvest nothing, and the 3-D selection tensor is stripped from the view."""
+    data = _make_entropy_data()
+    base, N, num_levels = build_block_reveal_base(
+        data,
+        mask_token_id=MASK,
+        pad_token_id=PAD,
+        block_size=BLOCK,
+        include_loss=False,
+        fast_entropy_level_ratio=0.5,
+    )
+    assert num_levels == 2  # ceil(0.5 * 4)
+    selected = base["block_reveal_selected_offsets"]
+    resp = base["diffu_grpo_response_lengths"]
+    noisy_len = int(base["diffu_grpo_noisy_lengths"][0].item())
+    cover = torch.zeros(N, noisy_len)
+    for j in range(num_levels):
+        view = make_reveal_level_view(base, j, BLOCK, SCORE)
+        assert "block_reveal_selected_offsets" not in view
+        target = view["diffu_grpo_target_ids"]
+        harvest = view["block_reveal_harvest_mask"]
+        cover += harvest[:, :noisy_len]
+        for s in range(N):
+            for b in range(selected.shape[1]):
+                o = int(selected[s, b, j].item())
+                for off in range(BLOCK):
+                    rel = b * BLOCK + off
+                    if rel >= int(resp[s].item()):
+                        continue
+                    ii = int(view["input_ids"][s, rel].item())
+                    if o >= 0 and off < o:
+                        assert ii == int(target[s, rel].item())
+                    else:
+                        assert ii == MASK
+                    expect_h = 1.0 if (o >= 0 and off == o) else 0.0
+                    assert float(harvest[s, rel].item()) == expect_h
+    # No response position is harvested by more than one level.
+    assert torch.all(cover <= 1.0)
+
+
+def test_fast_ratio_one_parity():
+    """``fast_entropy_level_ratio = 1.0`` keeps all offsets -> no selection is
+    attached and every reveal-level view is byte-for-byte identical to the full
+    Block JustGRPO path."""
+    data = _make_entropy_data()
+    base_full, _, nl_full = build_block_reveal_base(
+        data, mask_token_id=MASK, pad_token_id=PAD, block_size=BLOCK, include_loss=True
+    )
+    base_one, _, nl_one = build_block_reveal_base(
+        data,
+        mask_token_id=MASK,
+        pad_token_id=PAD,
+        block_size=BLOCK,
+        include_loss=True,
+        fast_entropy_level_ratio=1.0,
+    )
+    assert nl_one == nl_full
+    assert "block_reveal_selected_offsets" not in base_one
+    for j in range(nl_full):
+        vf = make_reveal_level_view(base_full, j, BLOCK, LOSS)
+        vo = make_reveal_level_view(base_one, j, BLOCK, LOSS)
+        for key in ("input_ids", "block_reveal_harvest_mask", "diffu_grpo_loss_mask"):
+            assert torch.equal(vf[key], vo[key]), key
+
+
+def test_fast_kept_mask_matches_per_level_harvest_and_is_sparse():
+    """The Fast kept mask == the union (== sum, harvests are disjoint) of the per-level
+    harvest masks, and covers strictly fewer tokens than the full response set -- so the
+    loss normalizer must use this count, not the full ``token_mask`` count (which is the
+    bug this guards)."""
+    data = _make_entropy_data()
+    base, N, num_levels = build_block_reveal_base(
+        data,
+        mask_token_id=MASK,
+        pad_token_id=PAD,
+        block_size=BLOCK,
+        include_loss=False,
+        fast_entropy_level_ratio=0.5,
+    )
+    assert num_levels == 2
+    # Independent reference: sum the actual per-level harvest masks the loss sees.
+    per_level_sum = None
+    for j in range(num_levels):
+        h = make_reveal_level_view(base, j, BLOCK, SCORE)["block_reveal_harvest_mask"]
+        per_level_sum = h if per_level_sum is None else per_level_sum + h
+    kept = build_block_kept_mask(base, BLOCK)
+    assert torch.equal(kept, per_level_sum)  # per-level harvests are disjoint (0/1)
+    kept_count = float(kept.sum())
+    full_count = float(base["diffu_grpo_score_mask"].sum())  # full response tokens
+    assert kept_count == float(per_level_sum.sum())
+    assert 0.0 < kept_count < full_count
+
+
+def test_fast_requires_reveal_tokens_per_level_one():
+    """JustGRPO-Fast is width-1 per selected offset; k>1 + Fast must raise (both the
+    training and logprob paths go through build_block_reveal_base)."""
+    data = _make_entropy_data()
+    with pytest.raises(ValueError, match="reveal_tokens_per_level == 1"):
+        build_block_reveal_base(
+            data,
+            mask_token_id=MASK,
+            pad_token_id=PAD,
+            block_size=BLOCK,
+            include_loss=False,
+            fast_entropy_level_ratio=0.5,
+            reveal_tokens_per_level=2,
+        )
+    # k>1 without Fast stays allowed.
+    _base, _n, levels = build_block_reveal_base(
+        data,
+        mask_token_id=MASK,
+        pad_token_id=PAD,
+        block_size=BLOCK,
+        include_loss=False,
+        reveal_tokens_per_level=2,
+    )
+    assert levels == 2
+
+
+def test_require_generation_entropy_raises_when_channel_absent():
+    """Fast active but generation emitted no entropy -> hard error (not zero-fill)."""
+    with_entropy = [
+        [{"role": "user"}, {"role": "assistant", "generation_entropy": torch.zeros(3)}]
+    ]
+    require_generation_entropy(with_entropy)  # present -> no raise
+
+    without_entropy = [[{"role": "user"}, {"role": "assistant"}]]
+    with pytest.raises(ValueError, match="return_entropy: true"):
+        require_generation_entropy(without_entropy)

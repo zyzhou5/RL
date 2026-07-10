@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Any, Literal, NotRequired, Optional, TypedDict, Union
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 
@@ -365,6 +365,14 @@ class BlockJustGRPOLogprobEstimationConfig(TypedDict):
     # objective matching generation that unmasks ``k`` tokens per step (SGLang
     # ``max_steps = block_size / k``); forward passes drop to ``ceil(block_size / k)``.
     reveal_tokens_per_level: NotRequired[int]
+    # JustGRPO-Fast: train only on the top ``fast_entropy_level_ratio`` fraction of
+    # highest-entropy within-block offsets (per sample, per block), cutting all
+    # three forward-pass loops to ``ceil(ratio * ceil(block_size / k))`` levels.
+    # Offsets are ranked by the rollout per-token entropy carried on the batch as
+    # ``generation_entropy`` (emitted by SGLang alongside ``generation_logprobs``).
+    # ``None`` / absent keeps the full block (current behavior); ``1.0`` reproduces
+    # it bitwise.
+    fast_entropy_level_ratio: NotRequired[Optional[float]]
     # Drop the MASK token from the scored logits (matches DiffuGRPO default).
     exclude_mask_token_from_logits: NotRequired[bool]
     # Microbatching reuses the standard policy.logprob_batch_size (logprobs) and
