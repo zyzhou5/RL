@@ -1845,6 +1845,14 @@ def grpo_train(
                         logprob_data["coupled_grpo_seed"] = train_data[
                             "coupled_grpo_seed"
                         ]
+                    # BlockJustGRPO-Fast builds its entropy-sparsified level selection
+                    # from generation_entropy in the logprob path too, so thread it into
+                    # the pruned logprob batch (no-op for other estimators, which never
+                    # read it). The async path passes full train_data, so it already has it.
+                    if "generation_entropy" in train_data:
+                        logprob_data["generation_entropy"] = train_data[
+                            "generation_entropy"
+                        ]
                     prev_logprobs_out = policy.get_logprobs(
                         logprob_data, timer=timer
                     )

@@ -234,6 +234,12 @@ def build_block_reveal_base(
     if fast_entropy_level_ratio is not None and num_levels > 0:
         m = max(1, math.ceil(float(fast_entropy_level_ratio) * num_levels))
         if m < num_levels:
+            if "generation_entropy" not in data:
+                raise KeyError(
+                    "BlockJustGRPO-Fast (fast_entropy_level_ratio) needs "
+                    "'generation_entropy' in the batch passed to get_logprobs/train; "
+                    "it was not threaded in (see grpo.py logprob_data construction)."
+                )
             entropy = data["generation_entropy"].to(base["input_ids"].device)
             base["block_reveal_selected_offsets"] = build_block_topk_offsets(
                 entropy=entropy,
