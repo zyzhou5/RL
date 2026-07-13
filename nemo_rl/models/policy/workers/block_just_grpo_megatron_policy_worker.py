@@ -83,6 +83,8 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             max_reveal_levels=cfg.get("max_reveal_levels"),
             reveal_tokens_per_level=reveal_k,
             fast_entropy_level_ratio=cfg.get("fast_entropy_level_ratio"),
+            eos_token_id=self.tokenizer.eos_token_id,
+            force_eos=cfg.get("fast_force_eos", True),
         )
         # One forward per reveal level; samples within a level are microbatched the
         # standard way by train_micro_batch_size (passed in as ``mbs``). A single
@@ -154,6 +156,8 @@ class BlockJustGRPOMegatronPolicyWorkerImpl(DiffuGRPOMegatronPolicyWorkerImpl):
             max_reveal_levels=cfg.get("max_reveal_levels"),
             reveal_tokens_per_level=reveal_k,
             fast_entropy_level_ratio=cfg.get("fast_entropy_level_ratio"),
+            eos_token_id=self.tokenizer.eos_token_id,
+            force_eos=cfg.get("fast_force_eos", True),
         )
         original_seq_len = int(data["input_ids"].shape[1])
         if num_levels == 0:

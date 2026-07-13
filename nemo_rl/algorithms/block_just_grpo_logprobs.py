@@ -133,6 +133,9 @@ def build_block_topk_offsets(
     completion_starts: torch.Tensor,
     block_size: int,
     m: int,
+    input_ids: torch.Tensor | None = None,
+    eos_token_id: int | None = None,
+    force_eos: bool = False,
 ) -> torch.Tensor:
     """Per-(sample, block) top-``m`` highest-entropy within-block offsets.
 
@@ -147,6 +150,12 @@ def build_block_topk_offsets(
     and harvests nothing in ``make_reveal_level_view``. Purely local per sample --
     no all-reduce, since only the level count ``m`` (not the offsets) must be
     DP-uniform, and it is a config-derived constant.
+
+    When ``force_eos`` is set (with ``input_ids`` and ``eos_token_id``), the EOS
+    token's within-block offset is boosted to ``+inf`` before the top-``m`` so it
+    always takes one of the ``m`` slots -- the termination token is always in the
+    trained set. ``m`` is unchanged, so the loss normalizer / DP-count are
+    untouched. No-op if no EOS falls inside the response span (e.g. truncated).
     """
     device = entropy.device
     num_samples, seq_len = entropy.shape
@@ -163,6 +172,15 @@ def build_block_topk_offsets(
     # Entropy is >= 0, so any negative fill ranks strictly below every valid
     # offset in the top-``m`` and is recoverable as padding.
     gathered = torch.where(valid, gathered, gathered.new_full((), -1.0))
+    if force_eos and eos_token_id is not None and input_ids is not None:
+        # Force the EOS token's offset into the top-``m`` of its block: boost its
+        # entropy to +inf so topk ranks it first. Only response-span positions are
+        # touched (valid), so a pad==eos collision can't force padding offsets.
+        tok = input_ids.to(device=device).gather(1, pos)
+        eos_mask = valid & (tok == int(eos_token_id))
+        gathered = torch.where(
+            eos_mask, gathered.new_full((), float("inf")), gathered
+        )
     grid = gathered.view(num_samples, num_blocks, k)  # [N, num_blocks, block_size]
 
     topk_vals, topk_idx = torch.topk(grid, m, dim=-1)  # [N, num_blocks, m]
@@ -184,6 +202,8 @@ def build_block_reveal_base(
     max_reveal_levels: int | None = None,
     reveal_tokens_per_level: int = 1,
     fast_entropy_level_ratio: float | None = None,
+    eos_token_id: int | None = None,
+    force_eos: bool = False,
 ) -> tuple[BatchedDataDict[Any], int, int, torch.Tensor | None]:
     """Build the fully-masked completion ``base`` (N rows) + level count.
 
@@ -251,6 +271,9 @@ def build_block_reveal_base(
                 completion_starts=base["diffu_grpo_completion_starts"],
                 block_size=block_size,
                 m=m,
+                input_ids=data["input_ids"],
+                eos_token_id=eos_token_id,
+                force_eos=force_eos,
             )
             num_levels = m
     return base, num_samples, num_levels, selected_offsets

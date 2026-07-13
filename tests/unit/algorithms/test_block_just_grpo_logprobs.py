@@ -440,3 +440,46 @@ def test_fast_training_schedule_has_no_nonsequence_tensors():
         for key, value in mb.data.items():
             if torch.is_tensor(value):
                 assert value.ndim <= 2, (key, tuple(value.shape))
+
+
+def test_force_eos_boosts_low_entropy_eos_offset():
+    """force_eos guarantees the EOS token's within-block offset is in the top-``m``
+    of its block even when its entropy is low, and keeps ``m`` unchanged."""
+    EOS = 7
+    S = 8
+    # Response tokens at positions 2..5 -> block 0, offsets 0..3.
+    entropy = torch.zeros(1, S)
+    entropy[0, 2] = 0.1  # offset 0 (EOS) -- lowest entropy
+    entropy[0, 3] = 0.2  # offset 1
+    entropy[0, 4] = 0.9  # offset 2
+    entropy[0, 5] = 1.0  # offset 3
+    input_ids = torch.ones(1, S, dtype=torch.long)
+    input_ids[0, 2] = EOS  # EOS at offset 0
+    response_lengths = torch.tensor([4])
+    completion_starts = torch.tensor([2])
+    kw = dict(
+        entropy=entropy,
+        response_lengths=response_lengths,
+        completion_starts=completion_starts,
+        block_size=4,
+        m=2,
+    )
+
+    # Plain top-2 by entropy picks the two highest-entropy offsets, NOT the EOS.
+    sel_plain = build_block_topk_offsets(**kw)
+    assert sel_plain.shape == (1, 1, 2)
+    assert sel_plain[0, 0].tolist() == [2, 3]  # EOS offset 0 excluded
+
+    # force_eos boosts the EOS offset into the kept set; m stays 2.
+    sel_eos = build_block_topk_offsets(
+        **kw, input_ids=input_ids, eos_token_id=EOS, force_eos=True
+    )
+    assert sel_eos.shape == (1, 1, 2)
+    assert 0 in sel_eos[0, 0].tolist()  # EOS offset now guaranteed kept
+    assert sel_eos[0, 0].tolist() == [0, 3]  # EOS + next-highest-entropy offset
+
+    # force_eos=False leaves the plain entropy selection unchanged.
+    sel_off = build_block_topk_offsets(
+        **kw, input_ids=input_ids, eos_token_id=EOS, force_eos=False
+    )
+    assert torch.equal(sel_off, sel_plain)

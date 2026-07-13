@@ -373,6 +373,11 @@ class BlockJustGRPOLogprobEstimationConfig(TypedDict):
     # ``None`` / absent keeps the full block (current behavior); ``1.0`` reproduces
     # it bitwise.
     fast_entropy_level_ratio: NotRequired[Optional[float]]
+    # When JustGRPO-Fast is active, always include the EOS token's within-block
+    # offset in the harvested/trained set (boost its entropy before top-k), so the
+    # termination token is guaranteed trained. Defaults to True when absent; set
+    # False to disable for ablation. ``m`` is unchanged (no normalization impact).
+    fast_force_eos: NotRequired[bool]
     # Drop the MASK token from the scored logits (matches DiffuGRPO default).
     exclude_mask_token_from_logits: NotRequired[bool]
     # Microbatching reuses the standard policy.logprob_batch_size (logprobs) and
