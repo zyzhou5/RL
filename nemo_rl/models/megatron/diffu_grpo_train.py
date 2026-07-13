@@ -9,6 +9,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_context_parallel_group,
+    get_context_parallel_rank,
+    get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
@@ -26,7 +29,8 @@ from nemo_rl.distributed.model_utils import (
     ChunkedDistributedLogprobWithSampling,
     DistributedLogprob,
     DistributedLogprobWithSampling,
-    gather_cp_sharded_logits,
+    _get_tokens_on_this_cp_rank,
+    allgather_cp_sharded_tensor,
 )
 from nemo_rl.models.megatron.train import LogprobsPostProcessor, LossPostProcessor
 from nemo_rl.models.policy import PolicyConfig
@@ -266,6 +270,45 @@ def _same_position_logprobs(
     return token_logprobs.contiguous()
 
 
+
+def _cp_sharded_same_position_logprobs(
+    output_tensor: torch.Tensor,
+    target_ids: torch.Tensor,
+    *,
+    cfg: PolicyConfig,
+    sampling_params: Optional[TrainingSamplingParams],
+    inference_only: bool,
+    exclude_token_id: Optional[int],
+) -> torch.Tensor:
+    """Per-position logprobs under unpacked CP without materializing full logits.
+
+    The model emits zigzag-sharded logits ``[B, S/cp, V/tp]``. Extracting at the
+    zigzag-sliced local target positions and all-gathering the ``[B, S/cp]``
+    result equals extracting from CP-gathered logits, minus the ``[B, S, V/tp]``
+    transient (~16 GiB at 32K/tp2 per gather). The gather's slice-backward stays
+    valid: every CP rank computes the identical loss from the replicated
+    ``[B, S]`` logprobs. No-op wrapper at cp_size == 1.
+    """
+    cp_size = get_context_parallel_world_size()
+    if cp_size > 1:
+        target_ids = _get_tokens_on_this_cp_rank(
+            target_ids, get_context_parallel_rank(), cp_size, seq_dim=1
+        )
+    token_logprobs = _same_position_logprobs(
+        output_tensor,
+        target_ids,
+        cfg=cfg,
+        sampling_params=sampling_params,
+        inference_only=inference_only,
+        exclude_token_id=exclude_token_id,
+    )
+    if cp_size > 1:
+        token_logprobs = allgather_cp_sharded_tensor(
+            token_logprobs, get_context_parallel_group(), seq_dim=1
+        )
+    return token_logprobs
+
+
 class DiffuGRPOLossPostProcessor(LossPostProcessor):
     """Megatron loss post-processor for one-pass fully-masked DiffuGRPO."""
 
@@ -300,15 +343,14 @@ class DiffuGRPOLossPostProcessor(LossPostProcessor):
         def loss_fn_inner(
             output_tensor: torch.Tensor,
         ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-            # CP: re-gather the zigzag-sharded logits to the full sequence before
-            # extracting logprobs at global target positions.
-            output_tensor = gather_cp_sharded_logits(output_tensor)
+            # CP: logits stay zigzag-sharded; _cp_sharded_same_position_logprobs
+            # extracts locally and gathers the [B, S] logprobs instead.
             logprob_estimation_cfg = self.cfg.get("logprob_estimation", {})
             mask_token_id = logprob_estimation_cfg.get("mask_token_id", None)
             exclude_mask = logprob_estimation_cfg.get(
                 "exclude_mask_token_from_logits", True
             )
-            token_logprobs = _same_position_logprobs(
+            token_logprobs = _cp_sharded_same_position_logprobs(
                 output_tensor,
                 data_dict["diffu_grpo_target_ids"],
                 cfg=self.cfg,
@@ -342,7 +384,7 @@ class DiffuGRPOLossPostProcessor(LossPostProcessor):
                 hasattr(self.loss_fn, "reference_policy_kl_penalty")
                 and self.loss_fn.reference_policy_kl_penalty != 0
             ):
-                curr_logprobs_unfiltered = _same_position_logprobs(
+                curr_logprobs_unfiltered = _cp_sharded_same_position_logprobs(
                     output_tensor,
                     data_dict["diffu_grpo_target_ids"],
                     cfg=self.cfg,
@@ -460,14 +502,14 @@ class DiffuGRPOLogprobsPostProcessor(LogprobsPostProcessor):
         cu_seqlens_padded: torch.Tensor,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         def processor_fn_inner(output_tensor):
-            # CP: re-gather the zigzag-sharded logits to the full sequence.
-            output_tensor = gather_cp_sharded_logits(output_tensor)
+            # CP: logits stay zigzag-sharded; the [B, S] logprobs are gathered
+            # after local extraction instead.
             logprob_estimation_cfg = self.cfg.get("logprob_estimation", {})
             mask_token_id = logprob_estimation_cfg.get("mask_token_id", None)
             exclude_mask = logprob_estimation_cfg.get(
                 "exclude_mask_token_from_logits", True
             )
-            token_logprobs = _same_position_logprobs(
+            token_logprobs = _cp_sharded_same_position_logprobs(
                 output_tensor,
                 data_dict["diffu_grpo_target_ids"],
                 cfg=self.cfg,

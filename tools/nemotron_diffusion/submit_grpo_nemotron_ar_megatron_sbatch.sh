@@ -74,6 +74,7 @@ export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 export NEMO_RL_SGLANG_KERNEL_SOURCE="${NEMO_RL_SGLANG_KERNEL_SOURCE:-/lustre/fsw/portfolios/coreai/users/snorouzi/wheels/sglang_kernel_torch210_cu129_py313/sglang_kernel-0.4.1-cp310-abi3-linux_x86_64.whl}"
 export NEMO_RL_SGLANG_FLASHINFER_SPECS="${NEMO_RL_SGLANG_FLASHINFER_SPECS:-flashinfer_python==0.6.7.post3 flashinfer_cubin==0.6.7.post3}"
 export EXTRA_CONFIG_OVERRIDES="${EXTRA_CONFIG_OVERRIDES:-}"
+export RUN_SCRIPT="${RUN_SCRIPT:-examples/run_grpo.py}"
 # Opt-in: set EXPANDABLE_SEGMENTS=true to add PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # to the megatron policy workers (mitigates fragmentation OOMs, e.g. in logprob at long seqlen).
 export EXPANDABLE_SEGMENTS="${EXPANDABLE_SEGMENTS:-false}"
@@ -177,7 +178,7 @@ run_training() {
     "${reinstall_args[@]}" \
     --extra mcore \
     --with onnx==1.19.1 \
-    python examples/run_grpo.py \
+    python "${RUN_SCRIPT:-examples/run_grpo.py}" \
     --config "${CONFIG}" \
     "checkpointing.checkpoint_dir=${CHECKPOINT_DIR}" \
     checkpointing.save_optimizer=true \

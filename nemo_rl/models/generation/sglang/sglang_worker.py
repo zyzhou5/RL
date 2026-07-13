@@ -534,6 +534,13 @@ class SGLangGenerationWorker:
         if top_k_val != -1:
             sampling_params["top_k"] = top_k_val
 
+        # Constant-length generation for sanity/benchmark runs: suppress EOS and
+        # stop tokens so every rollout runs to exactly max_new_tokens (uniform
+        # server finish times, deterministic memory footprint).
+        if self.cfg.get("ignore_eos", False):
+            sampling_params["ignore_eos"] = True
+            return sampling_params
+
         stop_token_ids = self.cfg.get("stop_token_ids")
         if stop_token_ids is not None:
             sampling_params["stop_token_ids"] = stop_token_ids
@@ -544,8 +551,11 @@ class SGLangGenerationWorker:
         if self.session is None:
             # Create connector with connection pool limit
             self.connector = aiohttp.TCPConnector(limit=512, limit_per_host=512)
-            # Create session with timeout
-            timeout = aiohttp.ClientTimeout(total=300)  # 5 minutes timeout
+            # Create session with timeout. Long diffusion generations (large
+            # max_new_tokens on 8B+ eager FastDiffuser decode) exceed the old
+            # hardcoded 5-minute total; sglang_cfg.request_timeout_s overrides.
+            timeout_s = int(self.sglang_cfg.get("request_timeout_s", 300))
+            timeout = aiohttp.ClientTimeout(total=timeout_s)
             self.session = aiohttp.ClientSession(
                 connector=self.connector, timeout=timeout
             )

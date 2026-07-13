@@ -62,6 +62,8 @@ class SglangSpecificArgs(TypedDict):
     mem_fraction_static: NotRequired[float | None]
     max_total_tokens: NotRequired[int | None]
     max_running_requests: NotRequired[int | None]
+    # Client-side per-request generate timeout in seconds (not a ServerArg).
+    request_timeout_s: NotRequired[int]
     chunked_prefill_size: NotRequired[int | None]
     max_prefill_tokens: NotRequired[int]
     schedule_policy: NotRequired[str]
@@ -103,6 +105,8 @@ class SglangSpecificArgs(TypedDict):
 
 
 class SGLangConfig(GenerationConfig):
+    # Suppress EOS/stop tokens: every generation runs to exactly max_new_tokens.
+    ignore_eos: NotRequired[bool]
     """Configuration for SGLang runtime."""
 
     sglang_cfg: SglangSpecificArgs

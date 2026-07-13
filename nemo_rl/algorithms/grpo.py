@@ -1955,6 +1955,17 @@ def grpo_train(
                     # Intermediate passes log their core train metrics at their
                     # own step here; the full metrics / validation / checkpoint
                     # block after this loop runs at the last pass's step.
+                    # Benchmark support: dump the exact global training batch
+                    # once (NRL_DUMP_TRAIN_BATCH=/path.pt) so
+                    # examples/run_train_bench.py can replay policy.train under
+                    # different parallelism layouts without regenerating rollouts.
+                    _dump_path = os.environ.get("NRL_DUMP_TRAIN_BATCH")
+                    if _dump_path and not os.path.exists(_dump_path):
+                        torch.save(dict(train_data), _dump_path)
+                        print(
+                            f"[train-bench] dumped training batch to {_dump_path}",
+                            flush=True,
+                        )
                     for update_idx in range(num_updates_per_rollout):
                         if num_updates_per_rollout > 1:
                             print(
