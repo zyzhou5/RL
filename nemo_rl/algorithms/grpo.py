@@ -161,6 +161,15 @@ class GRPOConfig(TypedDict):
     # When using dynamic sampling, generation prompt batch size will equal
     # num_prompts_per_step * batch_multiplier
     batch_multiplier: NotRequired[float]
+    # Number of optimizer passes over each rollout batch (lambda; "mu" in the
+    # GRPO paper, ppo_epochs in NeMo-RL's PPO). Passes 2..lambda re-train on the
+    # same rollout with the clipped ratio taken against the prev-logprobs frozen
+    # before the first pass. Every pass advances the global step, so
+    # max_num_steps / val_period / save_period count optimizer updates (one
+    # rollout spans lambda consecutive steps; validation and checkpointing run
+    # at the last step of a rollout). Default 1 (fully on-policy). Sync GRPO
+    # only.
+    num_updates_per_rollout: NotRequired[int]
     reward_shaping: RewardShapingConfig
     reward_scaling: RewardScalingConfig
     # By default advantages are calculated on CPU. Setting this flag to true leverages GPU for their computation.
@@ -390,6 +399,18 @@ def setup(
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
 
+    # Validate num_updates_per_rollout (lambda)
+    num_updates_per_rollout = int(grpo_config.get("num_updates_per_rollout", 1) or 1)
+    if num_updates_per_rollout > 1:
+        assert not loss_config.get("force_on_policy_ratio", False), (
+            "num_updates_per_rollout > 1 reuses each rollout for multiple off-policy "
+            "updates and is incompatible with loss_fn.force_on_policy_ratio"
+        )
+        assert not grpo_config.get("async_grpo", {}).get("enabled", False), (
+            "num_updates_per_rollout > 1 is only supported in synchronous GRPO"
+        )
+        print(f"  ✓ num_updates_per_rollout (lambda) = {num_updates_per_rollout}")
+
     # ==========================
     #          Cluster
     # ==========================
@@ -547,10 +568,16 @@ def setup(
     weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        ## NOTE: this is equal to the total number of scheduler steps
+        ## NOTE: this is equal to the total number of scheduler steps.
+        ## The global step counts optimizer updates: each rollout step advances
+        ## it num_updates_per_rollout times. max_num_steps is therefore already
+        ## in update units (rounded up to a whole rollout, since a rollout's
+        ## passes always run to completion), while the epoch bound counts
+        ## rollouts and must be scaled by num_updates_per_rollout.
+        lam = num_updates_per_rollout
         total_train_iters = min(
-            grpo_config["max_num_steps"],
-            grpo_config["max_num_epochs"] * train_sample_count,
+            (grpo_config["max_num_steps"] + lam - 1) // lam * lam,
+            grpo_config["max_num_epochs"] * train_sample_count * lam,
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -1438,6 +1465,9 @@ def grpo_train(
     val_at_start = master_config["grpo"]["val_at_start"]
     val_at_end = master_config["grpo"]["val_at_end"]
     val_period = master_config["grpo"]["val_period"]
+    num_updates_per_rollout = int(
+        master_config["grpo"].get("num_updates_per_rollout", 1) or 1
+    )  # lambda: optimizer passes per rollout batch
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
 
     # Initialize advantage estimator
@@ -1917,11 +1947,39 @@ def grpo_train(
 
                 print("▶ Training policy...", flush=True)
                 with timer.time("policy_training"):
-                    train_results = policy.train(
-                        train_data,
-                        loss_fn,
-                        timer=timer,
-                    )
+                    # lambda passes over the same rollout: prev/reference
+                    # logprobs stay frozen from before the first pass, so
+                    # passes 2..lambda are off-policy and rely on the clipped
+                    # ratio. Every pass advances the global step, so the
+                    # rollout occupies steps total_steps+1 .. total_steps+lambda.
+                    # Intermediate passes log their core train metrics at their
+                    # own step here; the full metrics / validation / checkpoint
+                    # block after this loop runs at the last pass's step.
+                    for update_idx in range(num_updates_per_rollout):
+                        if num_updates_per_rollout > 1:
+                            print(
+                                f"  ▶ Update pass {update_idx + 1}/{num_updates_per_rollout} (step {total_steps + 1})...",
+                                flush=True,
+                            )
+                        train_results = policy.train(
+                            train_data,
+                            loss_fn,
+                            timer=timer,
+                        )
+                        if update_idx < num_updates_per_rollout - 1:
+                            # sum over global batches to match the end-of-rollout
+                            # "loss" aggregation convention
+                            logger.log_metrics(
+                                {
+                                    "loss": float(train_results["loss"].sum()),
+                                    "grad_norm": float(
+                                        train_results["grad_norm"].mean()
+                                    ),
+                                },
+                                total_steps + 1,
+                                prefix="train",
+                            )
+                            total_steps += 1
 
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:

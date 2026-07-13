@@ -17,6 +17,14 @@ grpo:
   use_dynamic_sampling: false
   dynamic_sampling_max_gen_batches: 10
   batch_multiplier: 1
+  # lambda ("mu" in the GRPO paper): optimizer passes over each rollout batch.
+  # Passes 2..lambda re-train on the same rollout via the clipped ratio against
+  # the frozen prev-logprobs. Each pass advances the global step, so
+  # max_num_steps / val_period / save_period count optimizer updates and one
+  # rollout spans lambda consecutive steps. Requires
+  # loss_fn.force_on_policy_ratio=false and synchronous GRPO. 1 = fully
+  # on-policy (default behavior).
+  num_updates_per_rollout: 1
   reward_shaping:
     enabled: false
     overlong_buffer_length: 128
