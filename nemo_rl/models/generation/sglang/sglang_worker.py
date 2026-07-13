@@ -234,6 +234,8 @@ class SGLangGenerationWorker:
         self.is_model_owner = bundle_indices is not None
         self.global_rank = int(os.environ.get("RANK", "0"))
         self.sglang_cfg = config["sglang_cfg"]
+        # Memory-saver state: which server memory regions are currently released.
+        self._released_tags: set[str] = set()
 
         # Create a dedicated event loop thread for async operations
         # there will be issues if we use the event loop in the main thread
@@ -842,12 +844,81 @@ class SGLangGenerationWorker:
         )
 
     def sleep(self):
-        # TODO
-        pass
+        """Release SGLang GPU memory (weights + KV cache) for the training phase.
+
+        Posts release_memory_occupation to the co-located server so the training
+        forward/backward gets the GPU. Requires the server to run with
+        enable_memory_saver=true (no-op otherwise); the scheduler flushes the
+        radix cache when the KV pool is released, so no stale KV survives a
+        weight update. Only the model owner talks to its server.
+        """
+        if not self.is_model_owner:
+            return True
+        if not self.sglang_cfg.get("enable_memory_saver", False):
+            return True
+        if self._released_tags:
+            return True
+        # The release handler asserts server idleness, and a failed assert kills
+        # the scheduler loop. Abort any straggler requests (e.g. abandoned client
+        # retries keep generating server-side) and wait for the queues to drain
+        # before releasing; if the server never drains, keep its memory rather
+        # than crash it.
+        try:
+            self._make_request("abort_request", {"rid": "", "abort_all": True})
+        except Exception as e:
+            logger.warning(f"[SGLang Worker] abort_request before sleep failed: {e}")
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if self._server_is_idle():
+                break
+            time.sleep(1.0)
+        else:
+            logger.warning(
+                "[SGLang Worker] server not idle after 120s; skipping memory release this step"
+            )
+            return True
+        self._make_request(
+            "release_memory_occupation", {"tags": ["kv_cache", "weights"]}
+        )
+        self._released_tags = {"kv_cache", "weights"}
+        return True
+
+    def _server_is_idle(self) -> bool:
+        try:
+            r = requests.get(f"{self.base_url}/get_load", timeout=10)
+            r.raise_for_status()
+            loads = r.json()
+            if isinstance(loads, dict):
+                loads = [loads]
+            return all(
+                int(x.get("num_reqs", 0)) == 0 and int(x.get("num_waiting_reqs", 0)) == 0
+                for x in loads
+            )
+        except Exception as e:
+            logger.warning(f"[SGLang Worker] get_load failed while draining: {e}")
+            return False
 
     def wake_up(self, **kwargs):
-        # TODO
-        pass
+        """Resume SGLang GPU memory released by sleep().
+
+        tags=["weights"] / ["kv_cache"] resume selectively (the grpo refit
+        resumes weights first, pushes new weights, then resumes the KV cache);
+        no tags resumes everything still released. Idempotent per tag.
+        """
+        if not self.is_model_owner:
+            return True
+        if not self.sglang_cfg.get("enable_memory_saver", False):
+            return True
+        tags = kwargs.get("tags")
+        to_resume = (set(tags) if tags else set(self._released_tags)) & self._released_tags
+        if not to_resume:
+            return True
+        self._make_request(
+            "resume_memory_occupation",
+            {"tags": [t for t in ("weights", "kv_cache") if t in to_resume]},
+        )
+        self._released_tags -= to_resume
+        return True
 
     def shutdown(self) -> bool:
         """Shutdown the SGLang server process and cleanup async resources.

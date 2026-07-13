@@ -328,12 +328,39 @@ class SGLangGeneration(GenerationInterface):
         return url_to_uuids
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Wake workers up for colocated inference."""
-        pass
+        """Wake workers up for colocated inference (resume released SGLang memory)."""
+        if not self.cfg["colocated"]["enabled"]:
+            return True
+        if not self.cfg["sglang_cfg"].get("enable_memory_saver", False):
+            return True
+        try:
+            futures = self.worker_group.run_all_workers_single_data(
+                "wake_up",
+                run_rank_0_only_axes=["tensor_parallel"],
+                **kwargs,
+            )
+            results = ray.get(futures)
+            return all(result for result in results if result is not None)
+        except Exception as e:
+            logger.error(f"Error during SGLang wake_up: {e}")
+            return False
 
     def finish_generation(self, *args: Any, **kwargs: Any) -> bool:
-        """Sleep workers and reset prefix cache."""
-        pass
+        """Sleep workers: release SGLang weights + KV cache for the training phase."""
+        if not self.cfg["colocated"]["enabled"]:
+            return True
+        if not self.cfg["sglang_cfg"].get("enable_memory_saver", False):
+            return True
+        try:
+            futures = self.worker_group.run_all_workers_single_data(
+                "sleep",
+                run_rank_0_only_axes=["tensor_parallel"],
+            )
+            results = ray.get(futures)
+            return all(result for result in results if result is not None)
+        except Exception as e:
+            logger.error(f"Error during SGLang sleep: {e}")
+            return False
 
     def shutdown(self) -> bool:
         """Shut down all SGLang workers and clean up resources."""
