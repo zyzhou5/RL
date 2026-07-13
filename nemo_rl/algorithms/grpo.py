@@ -1961,11 +1961,25 @@ def grpo_train(
                                 f"  ▶ Update pass {update_idx + 1}/{num_updates_per_rollout} (step {total_steps + 1})...",
                                 flush=True,
                             )
+                        pass_start = time.perf_counter()
                         train_results = policy.train(
                             train_data,
                             loss_fn,
                             timer=timer,
                         )
+                        if num_updates_per_rollout > 1:
+                            # Per-update wall clock at every step; the rollout-level
+                            # timing block (generation, logprobs, the full
+                            # policy_training loop) still logs at the last pass's
+                            # step only.
+                            logger.log_metrics(
+                                {
+                                    "policy_training_pass": time.perf_counter()
+                                    - pass_start
+                                },
+                                total_steps + 1,
+                                prefix="timing/train",
+                            )
                         if update_idx < num_updates_per_rollout - 1:
                             # sum over global batches to match the end-of-rollout
                             # "loss" aggregation convention

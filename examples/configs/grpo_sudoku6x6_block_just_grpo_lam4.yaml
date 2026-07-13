@@ -1,0 +1,21 @@
+# Block JustGRPO on Nemotron-Labs-Diffusion-3B, 6x6 Sudoku, with lambda=4
+# (grpo.num_updates_per_rollout): 4 optimizer passes per rollout batch, passes
+# 2..4 off-policy via the clipped ratio against frozen prev-logprobs.
+# The global step counts optimizer updates (one rollout = 4 steps), so
+# val_period/save_period are scaled x4 to preserve the parent's
+# every-10-rollouts validation/checkpoint cadence.
+defaults:
+  - grpo_sudoku6x6_block_just_grpo.yaml
+
+grpo:
+  num_updates_per_rollout: 4
+  val_period: 40
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-block_just_grpo-lam4-sudoku6x6-megatron"
+  save_period: 40
+
+logger:
+  log_dir: "logs/grpo-nd3b-block_just_grpo-lam4-sudoku6x6-sglang"
+  wandb:
+    name: "grpo-nd3b-block_just_grpo-lam4-sudoku6x6-blanks-fewshot"
