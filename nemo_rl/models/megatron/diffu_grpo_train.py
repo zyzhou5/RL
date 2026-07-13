@@ -186,14 +186,19 @@ def _same_position_logprobs(
 
     logprob_chunk_size = cfg.get("logprob_chunk_size", None)
     target_ids = target_ids.to(device=logits.device, dtype=torch.long)
-    if local_exclude_index is not None:
+    # Branch on the GLOBAL exclude_token_id, not the per-rank local_exclude_index:
+    # under TP>1 the exclude token lives in only one rank's vocab shard, so keying the
+    # chunked path (one tp_group all_reduce per chunk) off local_exclude_index made TP
+    # ranks issue different numbers of TENSOR_MODEL_PARALLEL_GROUP collectives and hang.
+    if exclude_token_id is not None:
         seq_len = int(logits.shape[1])
         chunk_size = int(logprob_chunk_size or min(seq_len, 64))
         chunks = []
         for chunk_start in range(0, seq_len, chunk_size):
             chunk_end = min(seq_len, chunk_start + chunk_size)
             logits_chunk = logits[:, chunk_start:chunk_end, :].clone()
-            logits_chunk[..., local_exclude_index] = -torch.inf
+            if local_exclude_index is not None:
+                logits_chunk[..., local_exclude_index] = -torch.inf
             target_chunk = target_ids[:, chunk_start:chunk_end]
             if need_top_k_or_top_p_filtering(sampling_params):
                 chunk_logprobs = DistributedLogprobWithSampling.apply(  # type: ignore
