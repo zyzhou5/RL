@@ -10,6 +10,7 @@ defaults:
 policy:
   logprob_estimation:
     fast_entropy_level_ratio: 0.25
+    fast_force_eos: true
   generation:
     sglang_cfg:
       dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-block-justgrpo-fast/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_entropy.yaml"
