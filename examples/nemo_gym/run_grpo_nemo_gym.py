@@ -194,6 +194,7 @@ The validation set you pass in will directly be used for validation with no addi
     (
         policy,
         policy_generation,
+        val_policy_generation,
         cluster,
         dataloader,
         val_dataloader,
@@ -299,6 +300,7 @@ The validation set you pass in will directly be used for validation with no addi
             checkpointer,
             grpo_state,
             master_config,
+            val_policy_generation=val_policy_generation,
         )
 
 

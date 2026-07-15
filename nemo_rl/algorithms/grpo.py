@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import gc
 import os
 import time
@@ -223,6 +224,63 @@ class MasterConfig(TypedDict):
 # ===============================================================================
 
 
+def _deep_update(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge `overrides` into `base` (in place) and return `base`.
+
+    Nested dicts are merged key-by-key; any other value type replaces the base
+    value wholesale. Used to derive the validation generation config from the
+    rollout generation config.
+    """
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _val_overrides_need_server_group(overrides: Optional[dict[str, Any]]) -> bool:
+    """True when sglang_val_dllm_overrides asks for a dedicated validation engine.
+
+    Soft decode knobs (selection_policy/threshold/...) are handled at runtime
+    via reconfigure_dllm on the shared servers; an `sglang_cfg` key means the
+    validation engine differs structurally (fixed at server launch) and needs
+    its own server group.
+    """
+    return bool(overrides) and "sglang_cfg" in overrides
+
+
+def _build_val_generation_config(
+    generation_config: "SGLangConfig",
+) -> Optional["SGLangConfig"]:
+    """Build the config for the validation-only SGLang server group.
+
+    Starts from a deep copy of the rollout generation config and applies the
+    `sglang_val_dllm_overrides` overrides on top, so configs only need to state
+    what differs for validation (e.g. dllm_algorithm / json_model_override_args).
+    Returns None when no validation server group is requested (absent overrides
+    or soft-knob-only overrides, which use the runtime reconfigure path).
+    """
+    overrides = generation_config.get("sglang_val_dllm_overrides")
+    if not _val_overrides_need_server_group(overrides):
+        return None
+    val_config = copy.deepcopy(generation_config)
+    # The validation group's decode policy is pinned by its own launch config:
+    # it must not recurse into another validation group or trigger the
+    # validation-time reconfigure hook on itself.
+    val_config["sglang_val_dllm_overrides"] = None
+    _deep_update(val_config, copy.deepcopy(overrides))
+
+    for group, cfg in (("rollout", generation_config), ("validation", val_config)):
+        assert cfg["sglang_cfg"].get("enable_memory_saver", False), (
+            f"sglang_val_dllm_overrides with sglang_cfg (dedicated validation server "
+            f"group) requires enable_memory_saver=true on the {group} server group's "
+            "sglang_cfg: the two groups time-share GPU memory (each sleeps while the "
+            "other generates)."
+        )
+    return val_config
+
+
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
@@ -231,6 +289,7 @@ def setup(
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[
     ColocatablePolicyInterface,
+    Optional[GenerationInterface],
     Optional[GenerationInterface],
     tuple[RayVirtualCluster, RayVirtualCluster],
     StatefulDataLoader | MultipleDataloaderWrapper,
@@ -417,6 +476,30 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
 
+    # sglang_val_dllm_overrides containing an sglang_cfg key requests a second
+    # SGLang server group used only for validation (e.g. AR rollouts +
+    # diffusion validation: the engine mode is fixed at server launch, so
+    # decoding under a structurally different engine needs its own servers).
+    # Validated up front so misconfigurations fail before any cluster/worker
+    # setup. Soft-knob-only overrides keep the legacy runtime reconfigure path.
+    val_needs_server_group = _val_overrides_need_server_group(
+        generation_config.get("sglang_val_dllm_overrides")
+    )
+    if val_needs_server_group:
+        assert generation_config["backend"] == "sglang", (
+            "sglang_val_dllm_overrides with sglang_cfg is only supported with the "
+            f"sglang generation backend, but got backend={generation_config['backend']}."
+        )
+        assert colocated_inference, (
+            "sglang_val_dllm_overrides with sglang_cfg (dedicated validation server "
+            "group) requires colocated inference: the validation servers share GPUs "
+            "with training and time-share memory via the SGLang memory saver."
+        )
+        assert not grpo_config.get("async_grpo", {}).get("enabled", False), (
+            "sglang_val_dllm_overrides with sglang_cfg (dedicated validation server "
+            "group) is not supported with async GRPO."
+        )
+
     env_name_list = extract_necessary_env_names(data_config)
     rm_env_enabled = "reward_model" in env_name_list
 
@@ -449,14 +532,19 @@ def setup(
         else:
             policy_gpus_per_node = cluster_config["gpus_per_node"]
 
+        if generation_config["backend"] == "megatron":
+            max_colocated_worker_groups = 1
+        elif val_needs_server_group:
+            # policy + rollout servers + validation servers share each GPU
+            max_colocated_worker_groups = 3
+        else:
+            max_colocated_worker_groups = 2
         cluster = RayVirtualCluster(
             name="grpo_policy_cluster",
             bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
             use_gpus=True,
             num_gpus_per_node=policy_gpus_per_node,
-            max_colocated_worker_groups=1
-            if generation_config["backend"] == "megatron"
-            else 2,
+            max_colocated_worker_groups=max_colocated_worker_groups,
         )
         train_cluster = cluster
         inference_cluster = cluster
@@ -672,6 +760,7 @@ def setup(
         return policy_generation, policy
 
     # Handle generation-specific setup
+    val_policy_generation = None  # set only when val overrides carry sglang_cfg
     if backend == "megatron":
         # Megatron generation: policy_generation is None, only initialize policy
         policy_generation = None
@@ -732,6 +821,30 @@ def setup(
         if "model_path" not in generation_config["sglang_cfg"]:
             generation_config["sglang_cfg"]["model_path"] = policy_config["model_name"]
 
+        # Optionally launch the validation-only server group first, while GPU
+        # memory is still clean, then put it to sleep (memory saver) so the
+        # rollout servers and the policy can initialize as usual. It is woken
+        # up (and refit with current weights) only around validation.
+        val_generation_config = _build_val_generation_config(generation_config)
+        if val_generation_config is not None:
+            print(
+                "  ▶ Initializing validation SGLang server group "
+                f"(dllm_algorithm={val_generation_config['sglang_cfg'].get('dllm_algorithm')})...",
+                flush=True,
+            )
+            t0 = time.perf_counter()
+            val_policy_generation = SGLangGeneration(
+                cluster=inference_cluster,
+                config=val_generation_config,
+                # Ray named actors must be unique; the rollout group owns the
+                # default "sglang_policy" prefix.
+                name_prefix="sglang_val",
+            )
+            val_policy_generation.finish_generation()
+            worker_init_timing_metrics["sglang_val_init_time_s"] = (
+                time.perf_counter() - t0
+            )
+
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
             generation_name="SGLang",
@@ -775,6 +888,8 @@ def setup(
     state_dict_info = policy.prepare_refit_info()
     if policy_generation is not None:
         policy_generation.prepare_refit_info(state_dict_info)
+    if val_policy_generation is not None:
+        val_policy_generation.prepare_refit_info(state_dict_info)
 
     # Calculate total setup time
     total_setup_time = time.perf_counter() - setup_start_time
@@ -812,6 +927,7 @@ def setup(
     return (
         policy,
         policy_generation,
+        val_policy_generation,
         (train_cluster, inference_cluster),
         dataloader,
         val_dataloader,
@@ -1416,8 +1532,15 @@ def grpo_train(
     checkpointer: CheckpointManager,
     grpo_save_state: GRPOSaveState,
     master_config: MasterConfig,
+    val_policy_generation: Optional[GenerationInterface] = None,
 ) -> None:
-    """Run GRPO training algorithm."""
+    """Run GRPO training algorithm.
+
+    When `val_policy_generation` is provided (a dedicated SGLang server group
+    built from sglang_val_dllm_overrides containing sglang_cfg), validation decodes on
+    it instead of the rollout servers: it is refit with the current policy
+    weights right before each validation and put back to sleep right after.
+    """
     timer = Timer()
     timeout = TimeoutChecker(
         timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
@@ -1479,21 +1602,39 @@ def grpo_train(
         print("\n🔍 Running initial validation...", flush=True)
         memory_tracker.snapshot_start_of_stage("Initial validation", dir())
 
-        if NEED_REFIT and POLICY_GENERATION_STALE:
+        if val_policy_generation is not None:
+            # Dedicated validation servers: refit them with the current weights
+            # and leave the rollout servers untouched (they get refit lazily at
+            # the next rollout since POLICY_GENERATION_STALE stays True).
+            refit_policy_generation(policy, val_policy_generation, colocated_inference)
+            val_generation = val_policy_generation
+        elif NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(policy, policy_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
+            val_generation = policy_generation
         else:
             policy_generation.prepare_for_generation()
+            val_generation = policy_generation
         val_metrics, validation_timings = validate(
-            policy_generation,
+            val_generation,
             val_dataloader,
             tokenizer,
             val_task_to_env,
             step=0,
             master_config=master_config,
             logger=logger,
+            generation_config=val_policy_generation.cfg
+            if val_policy_generation is not None
+            else None,
         )
-        policy_generation.finish_generation()
+        val_generation.finish_generation()
+        if val_policy_generation is not None:
+            # Weight streaming assumes GPU-resident policy weights (normally
+            # guaranteed by the training step preceding every refit), but the
+            # val-group refit above ended with offload_after_refit and the
+            # rollout-group refit comes next with no training in between.
+            # Onload the weights again to restore that invariant.
+            policy.prepare_for_lp_inference()
         logger.log_metrics(val_metrics, current_step, prefix="validation")
         logger.log_metrics(validation_timings, current_step, prefix="timing/validation")
 
@@ -2031,7 +2172,18 @@ def grpo_train(
                     val_at_end and is_last_step
                 ):
                     memory_tracker.snapshot_start_of_stage("Validation", dir())
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if val_policy_generation is not None:
+                        # Dedicated validation servers: refit them with the
+                        # current weights and leave the rollout servers asleep
+                        # (they get refit at the next rollout as usual).
+                        refit_policy_generation(
+                            policy,
+                            val_policy_generation,
+                            colocated_inference,
+                            kv_scales=kv_scales_cache if sync_kv_scales else None,
+                        )
+                        val_generation = val_policy_generation
+                    elif NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             policy,
                             policy_generation,
@@ -2039,20 +2191,29 @@ def grpo_train(
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         POLICY_GENERATION_STALE = False
+                        val_generation = policy_generation
                     else:
                         if colocated_inference:
                             policy.offload_after_refit()  # unload optimizer to make space for generation
                         policy_generation.prepare_for_generation()
+                        val_generation = policy_generation
                     val_metrics, validation_timings = validate(
-                        policy_generation,
+                        val_generation,
                         val_dataloader,
                         tokenizer,
                         val_task_to_env,
                         step=total_steps + 1,
                         master_config=master_config,
                         logger=logger,
+                        generation_config=val_policy_generation.cfg
+                        if val_policy_generation is not None
+                        else None,
                     )
-                    policy_generation.finish_generation()
+                    val_generation.finish_generation()
+                    if val_policy_generation is not None:
+                        # Restore the GPU-resident-weights invariant for the
+                        # next rollout refit (see the val_at_start site).
+                        policy.prepare_for_lp_inference()
                     logger.log_metrics(
                         validation_timings, total_steps + 1, prefix="timing/validation"
                     )
@@ -2416,8 +2577,16 @@ def validate(
     step: int,
     master_config: MasterConfig,
     logger: Optional[Logger] = None,
+    generation_config: Optional[dict[str, Any]] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Run validation on the validation dataset."""
+    """Run validation on the validation dataset.
+
+    Args:
+        generation_config: Config of the generation engine actually used for
+            validation. Defaults to master_config["policy"]["generation"]; pass
+            the dedicated validation group's config when validating on a second
+            server group so decode overrides are read from the right config.
+    """
     if val_dataloader is None:
         assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
             "val_dataloader is None, so dpo.val_period must be 0"
@@ -2441,10 +2610,21 @@ def validate(
         # validation so val curves are comparable across runs that roll out with
         # different policies (e.g. leftmost vs confidence). Only affects the
         # SGLang FastDiffuser backend; a no-op otherwise. Restored in `finally`.
-        gen_cfg = master_config["policy"]["generation"]
+        gen_cfg = (
+            generation_config
+            if generation_config is not None
+            else master_config["policy"]["generation"]
+        )
         val_dllm_overrides = gen_cfg.get("sglang_val_dllm_overrides")
         restore_dllm_overrides = None
-        if val_dllm_overrides and gen_cfg.get("backend") == "sglang":
+        # Overrides containing sglang_cfg describe a dedicated validation
+        # server group (already launched with them baked in), not runtime
+        # decode knobs — never feed them to reconfigure_dllm.
+        if (
+            val_dllm_overrides
+            and not _val_overrides_need_server_group(val_dllm_overrides)
+            and gen_cfg.get("backend") == "sglang"
+        ):
             restore_dllm_overrides = policy_generation.reconfigure_dllm(
                 val_dllm_overrides
             )

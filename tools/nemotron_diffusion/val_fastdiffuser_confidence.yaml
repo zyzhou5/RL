@@ -1,0 +1,11 @@
+# FastDiffuser decode config for a validation-only SGLang server group
+# (wired in via sglang_val_dllm_overrides.sglang_cfg.dllm_algorithm_config).
+# Block-wise confidence reveal with threshold 0.9, like the standard offline
+# eval decode but with 16-token blocks.
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 16
+causal_context: true
+temperature: 1.0
+threshold: 0.9
+selection_policy: confidence

@@ -111,8 +111,31 @@ class SGLangConfig(GenerationConfig):
 
     sglang_cfg: SglangSpecificArgs
     sglang_kwargs: NotRequired[dict[str, Any]]
-    # Optional FastDiffuser decoding overrides applied ONLY during validation
-    # (e.g. {"selection_policy": "confidence", "threshold": 0.9}) so validation
-    # curves are comparable across runs with different rollout decoding policies.
-    # Absent/None => validation uses the same decoding as rollout (legacy behavior).
+    # Optional overrides describing how VALIDATION decoding differs from
+    # rollout decoding. Two modes, selected by the dict's content:
+    #
+    # 1. Soft decode knobs only (no "sglang_cfg" key), e.g.
+    #      {"selection_policy": "confidence", "threshold": 0.9}
+    #    Applied at validation time via reconfigure_dllm on the live rollout
+    #    servers and restored afterwards. Requires the rollout servers to run
+    #    a DLLM algorithm (legacy behavior, unchanged).
+    #
+    # 2. Contains an "sglang_cfg" key => validation needs a structurally
+    #    different engine (AR vs diffusion is fixed at server launch and
+    #    cannot be reconfigured at runtime). The dict is deep-merged on top
+    #    of a copy of this generation config and a SECOND SGLang server
+    #    group is launched from it, used only for validation, e.g.
+    #      sglang_val_dllm_overrides:
+    #        sglang_cfg:
+    #          json_model_override_args: '{}'
+    #          dllm_algorithm: "FastDiffuser"
+    #          dllm_algorithm_config: "tools/nemotron_diffusion/val_dllm.yaml"
+    #    Top-level generation keys (e.g. temperature) may also be overridden;
+    #    soft DLLM knobs like selection_policy belong in the algorithm config
+    #    file in this mode, not in this dict. Requires colocated inference,
+    #    synchronous GRPO, and enable_memory_saver=true on both server groups
+    #    (they time-share GPU memory: the validation servers sleep except
+    #    during validation).
+    #
+    # Absent/None => validation uses the same decoding as rollout.
     sglang_val_dllm_overrides: NotRequired[dict[str, Any] | None]

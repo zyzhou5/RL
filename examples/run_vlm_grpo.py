@@ -106,6 +106,7 @@ def main() -> None:
     (
         policy,
         policy_generation,
+        val_policy_generation,
         cluster,
         dataloader,
         val_dataloader,
@@ -129,6 +130,7 @@ def main() -> None:
         checkpointer,
         grpo_state,
         master_config,
+        val_policy_generation=val_policy_generation,
     )
 
 
