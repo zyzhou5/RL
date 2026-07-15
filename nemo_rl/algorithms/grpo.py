@@ -1330,9 +1330,27 @@ def refit_policy_generation(
             )
             raise RuntimeError(error_message)
 
+    # The engine now holds freshly transferred weights: clear any
+    # weights-released-by-sleep marker it may be carrying.
+    mark_fresh = getattr(policy_generation, "mark_weights_fresh", None)
+    if mark_fresh is not None:
+        mark_fresh()
+
     if colocated_inference:
         policy.offload_after_refit()
         policy_generation.prepare_for_generation(tags=["kv_cache"])
+
+
+def generation_needs_weight_refit(policy_generation: GenerationInterface) -> bool:
+    """True when the engine reports its weights were physically released.
+
+    Some engines free their weight memory when put to sleep (e.g. SGLang
+    with enable_memory_saver), so the weights must be re-transferred before
+    the next generation even if the policy version is unchanged. Engines
+    that do not implement the protocol never force a refit.
+    """
+    needs = getattr(policy_generation, "needs_weight_refit", None)
+    return bool(needs()) if needs is not None else False
 
 
 def _log_mixed_rewards_and_advantages_information(
@@ -1608,7 +1626,10 @@ def grpo_train(
             # the next rollout since POLICY_GENERATION_STALE stays True).
             refit_policy_generation(policy, val_policy_generation, colocated_inference)
             val_generation = val_policy_generation
-        elif NEED_REFIT and POLICY_GENERATION_STALE:
+        elif NEED_REFIT and (
+                        POLICY_GENERATION_STALE
+                        or generation_needs_weight_refit(policy_generation)
+                    ):
             refit_policy_generation(policy, policy_generation, colocated_inference)
             POLICY_GENERATION_STALE = False
             val_generation = policy_generation
@@ -1699,7 +1720,10 @@ def grpo_train(
                     flush=True,
                 )
                 with timer.time("prepare_for_generation/total"):
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if NEED_REFIT and (
+                        POLICY_GENERATION_STALE
+                        or generation_needs_weight_refit(policy_generation)
+                    ):
                         # Compute KV scales if needed for FP8 quantization
                         if sync_kv_scales and kv_scales_cache is None:
                             print("▶ Computing KV cache scales...", flush=True)
@@ -2183,7 +2207,10 @@ def grpo_train(
                             kv_scales=kv_scales_cache if sync_kv_scales else None,
                         )
                         val_generation = val_policy_generation
-                    elif NEED_REFIT and POLICY_GENERATION_STALE:
+                    elif NEED_REFIT and (
+                        POLICY_GENERATION_STALE
+                        or generation_needs_weight_refit(policy_generation)
+                    ):
                         refit_policy_generation(
                             policy,
                             policy_generation,
@@ -2967,7 +2994,10 @@ def async_grpo_train(
     )
 
     print("⏳ Preparing policy generation for training...")
-    if NEED_REFIT and POLICY_GENERATION_STALE:
+    if NEED_REFIT and (
+                        POLICY_GENERATION_STALE
+                        or generation_needs_weight_refit(policy_generation)
+                    ):
         print("🔄 Refitting policy generation with actual model weights...")
         try:
             refit_policy_generation(policy, policy_generation, colocated_inference)
@@ -3352,7 +3382,10 @@ def async_grpo_train(
                     # Pause trajectory collection during validation to reduce memory pressure
                     trajectory_collector.pause.remote()
 
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
+                    if NEED_REFIT and (
+                        POLICY_GENERATION_STALE
+                        or generation_needs_weight_refit(policy_generation)
+                    ):
                         refit_policy_generation(
                             policy, policy_generation, colocated_inference
                         )

@@ -351,6 +351,12 @@ class SGLangGeneration(GenerationInterface):
             return True
         if not self.cfg["sglang_cfg"].get("enable_memory_saver", False):
             return True
+        # Sleeping with the memory saver physically releases the servers'
+        # weight tensors. From this point the engine must not be trusted
+        # to hold valid weights until the next refit (see
+        # needs_weight_refit); set the marker before issuing the sleep so
+        # even a partially failed sleep is treated as released.
+        self._weights_released_by_sleep = True
         try:
             futures = self.worker_group.run_all_workers_single_data(
                 "sleep",
@@ -361,6 +367,20 @@ class SGLangGeneration(GenerationInterface):
         except Exception as e:
             logger.error(f"Error during SGLang sleep: {e}")
             return False
+
+    def needs_weight_refit(self) -> bool:
+        """Whether server weight memory was released by the last sleep.
+
+        True means the next generation MUST be preceded by a weight
+        transfer regardless of policy version: with enable_memory_saver,
+        finish_generation() frees the weight tensors and wake_up() only
+        re-allocates them, leaving uninitialized contents.
+        """
+        return getattr(self, "_weights_released_by_sleep", False)
+
+    def mark_weights_fresh(self) -> None:
+        """Record that a weight transfer restored valid server weights."""
+        self._weights_released_by_sleep = False
 
     def shutdown(self) -> bool:
         """Shut down all SGLang workers and clean up resources."""
