@@ -1,0 +1,59 @@
+# BlockJustGRPO on Nemotron-Labs-Diffusion-8B-v1.5-sft (ORIGINAL checkpoint, no shim),
+# DeepScaleR train / AIME 2024 val at 8K context.
+#
+# 8B-checkpoint variant of deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron_8k.yaml:
+# identical algorithm and 8K sequence budget (350 prompt + 7840 gen, max_new_tokens divisible
+# by block sizes 16/32), only the base checkpoint and run/log names change.
+#
+# Requires the native NemotronLabsDiffusionModel arch support (2026-07-14): Bridge
+# 3rdparty-workspace commit a5fb5809 + sglang-a652eb48 commit ba53a4635 (see
+# plans/nemotron_labs_diffusion_v15_native.md). The checkpoint is the same
+# 34-layer / hidden-4096 / GQA-8 body as Exp-Ministral-8B-v2 but with yarn x8
+# => 131072 max positions (NOT 262144) -- irrelevant at 8K, matters if this is
+# ever extended toward 128K.
+#
+# Parallelism: tp=2 / pp=1 / cp=1 (tp=1 OOMs in the 8K training backward --
+# see megatron_cfg comment below). On 16 nodes => dp=64.
+#
+# block_size=16 override (policy.hf_config_overrides, inherited) triggers a fresh
+# one-time HF->mcore conversion for this checkpoint under its own hfovr cache path.
+#
+# causal_context=true is inherited via block_just_grpo_leftmost_dllm_bs16.yaml
+# (the ministral-family regime, same as the 3B and Exp-8B). If v1.5's SFT used a
+# bidirectional prefix instead, rollouts will be degraded -- confirm before long runs.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron_8k.yaml"
+
+policy:
+  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-8B-v1.5-sft"
+
+  megatron_cfg:
+    # tp=1 OOMs in the training backward at 8K (smoke 13974966: ~61.7 GiB
+    # allocated + 7.7 GiB request on the doubled ~13K-token step-2 batch).
+    # tp=2 halves the ~44 GiB/rank static footprint (weights+grads+sharded opt).
+    tensor_model_parallel_size: 2
+
+  # BlockJustGRPO-Fast: entropy-sparsified block-reveal. Keep only the top-50%
+  # highest-entropy within-block offsets (m = ceil(0.5*16) = 8 reveal levels /
+  # forward passes instead of 16) for both logprob estimation and training.
+  logprob_estimation:
+    fast_entropy_level_ratio: 0.5
+    fast_force_eos: true
+
+  generation:
+    sglang_cfg:
+      # 8B: release SGLang weights+KV during training (same rationale as the 8B
+      # 32K/cp4 config). With the inherited enable_memory_saver=false the server
+      # pins mem_fraction_static=0.55 of the GPU all step, which starves the 8B
+      # Megatron policy (weights+grads alone are ~32 GiB at tp=1).
+      enable_memory_saver: true
+      # return_entropy: true variant -- the fast trainer ranks offsets by the
+      # SGLang per-token rollout entropy, so generation must emit it.
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_entropy.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-8b-v15-block-just-grpo-deepscaler-8k-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-8b-v15-block-just-grpo-deepscaler-8k-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-8b-v15-block-just-grpo-deepscaler-8k-megatron-sglang"

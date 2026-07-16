@@ -248,6 +248,19 @@ class SGLangGeneration(GenerationInterface):
         # Get results from the workers
         results = self.worker_group.get_all_worker_results(future_bundle)
 
+        # "entropy" is an optional per-request channel (FastDiffuser
+        # return_entropy): a worker only includes the key when at least one of
+        # its requests produced entropy. Under validation decode overrides some
+        # shards legitimately come back without it, and from_batches requires a
+        # uniform key set across batches -- keep the channel only when every
+        # worker emitted it, otherwise drop it (all consumers treat it as
+        # optional; training separately fail-fasts via require_generation_entropy).
+        if any("entropy" in r for r in results) and not all(
+            "entropy" in r for r in results
+        ):
+            for r in results:
+                r.pop("entropy", None)
+
         # Combine results from all servers
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
             results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}
