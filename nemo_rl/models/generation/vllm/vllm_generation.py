@@ -490,6 +490,19 @@ class VllmGeneration(GenerationInterface):
         # Get results from the workers, respecting tied worker groups (only one result per tied worker group)
         results = self.worker_group.get_all_worker_results(future_bundle)
 
+        # "entropy" is an optional per-request channel (diffusion
+        # return_entropy): a worker only includes the key when at least one
+        # of its requests produced entropy, and from_batches requires a
+        # uniform key set across batches -- keep the channel only when every
+        # worker emitted it, otherwise drop it (all consumers treat it as
+        # optional; training separately fail-fasts via
+        # require_generation_entropy).
+        if any("entropy" in r for r in results) and not all(
+            "entropy" in r for r in results
+        ):
+            for r in results:
+                r.pop("entropy", None)
+
         # Combine results from all tied worker groups
         combined: BatchedDataDict[GenerationOutputSpec] = BatchedDataDict.from_batches(
             results, pad_value_dict={"output_ids": self.cfg["_pad_token_id"]}

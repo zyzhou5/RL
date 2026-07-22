@@ -782,6 +782,12 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         "truncated": truncated_tensor,
                     }
                 )
+                if self.return_entropy:
+                    # Keep the optional entropy channel's key set consistent
+                    # across per-sample results (no generation -> all zeros).
+                    result_batch["entropy"] = torch.zeros_like(
+                        logprobs_single_item
+                    )
 
                 return (sample_idx, result_batch)
 
@@ -846,23 +852,49 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 dtype=torch.float32,
                 device=original_input_ids_single_row.device,
             )
+            # Diffusion entropy channel (return_entropy): commits carry the
+            # at-unmask entropy as a second logprob entry keyed by the mask
+            # token id (never a sampled token).
+            entropy_single_item = (
+                torch.zeros(
+                    (1, final_output_tensor_len),
+                    dtype=torch.float32,
+                    device=original_input_ids_single_row.device,
+                )
+                if self.return_entropy
+                else None
+            )
             if hasattr(generation_details, "logprobs") and generation_details.logprobs:
                 for idx, logprob_dict_per_token in enumerate(
                     generation_details.logprobs
                 ):
                     if logprob_dict_per_token and idx < len(generated_token_ids):
                         token_id_at_idx = generated_token_ids[idx]
+                        position_in_output_tensor = (
+                            current_input_actual_length + idx
+                        )
+                        if position_in_output_tensor >= final_output_tensor_len:
+                            continue
                         if token_id_at_idx in logprob_dict_per_token:
                             logprob_value = logprob_dict_per_token[
                                 token_id_at_idx
                             ].logprob
-                            position_in_output_tensor = (
-                                current_input_actual_length + idx
+                            logprobs_single_item[0, position_in_output_tensor] = (
+                                logprob_value
                             )
-                            if position_in_output_tensor < final_output_tensor_len:
-                                logprobs_single_item[0, position_in_output_tensor] = (
-                                    logprob_value
-                                )
+                        if entropy_single_item is not None:
+                            entropy_value = next(
+                                (
+                                    lp.logprob
+                                    for tid, lp in logprob_dict_per_token.items()
+                                    if tid != token_id_at_idx
+                                ),
+                                None,
+                            )
+                            if entropy_value is not None:
+                                entropy_single_item[
+                                    0, position_in_output_tensor
+                                ] = entropy_value
 
             # Generation lengths
             generation_lengths_tensor = torch.tensor(
@@ -896,6 +928,8 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     "truncated": truncated_tensor,
                 }
             )
+            if entropy_single_item is not None:
+                result_batch["entropy"] = entropy_single_item
 
             return (sample_idx, result_batch)
 

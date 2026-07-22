@@ -141,6 +141,14 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
+        # Diffusion entropy channel (JustGRPO-Fast): when the engine runs
+        # with diffusion_config.return_entropy, commits carry per-token
+        # entropy as a second logprob column keyed by the mask token id;
+        # sampling params must request logprobs=1 so it survives truncation.
+        _diffusion_cfg = (self.cfg.get("vllm_kwargs") or {}).get(
+            "diffusion_config"
+        ) or {}
+        self.return_entropy = bool(_diffusion_cfg.get("return_entropy", False))
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
@@ -618,7 +626,7 @@ class BaseVllmGenerationWorker:
             top_p=self.cfg["top_p"],
             top_k=top_k_val,
             max_tokens=max_tokens,
-            logprobs=0,
+            logprobs=1 if self.return_entropy else 0,
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
@@ -754,6 +762,8 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
+        entropy_list = []
+        any_entropy = False
         generation_lengths = []
         unpadded_sequence_lengths = []
         truncated_list = []  # Track if response was truncated (hit max_tokens)
@@ -785,20 +795,29 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             output_ids_list.append(full_output)
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
+            full_entropy = torch.zeros(total_length, dtype=torch.float32)
             if hasattr(generation, "logprobs") and generation.logprobs:
                 try:
                     for idx, logprob_dict in enumerate(generation.logprobs):
                         if logprob_dict:
                             position = sequence_length + idx
-                            full_logprobs[position] = next(iter(logprob_dict.items()))[
-                                1
-                            ].logprob
+                            entries = iter(logprob_dict.items())
+                            full_logprobs[position] = next(entries)[1].logprob
+                            if self.return_entropy:
+                                # Diffusion entropy channel: the second
+                                # entry (keyed by the mask token id) carries
+                                # the at-unmask entropy, not a logprob.
+                                entropy_entry = next(entries, None)
+                                if entropy_entry is not None:
+                                    any_entropy = True
+                                    full_entropy[position] = entropy_entry[1].logprob
                 except Exception:
                     import traceback
 
                     traceback.print_exc()
 
             logprobs_list.append(full_logprobs)
+            entropy_list.append(full_entropy)
 
             response_length = sequence_length + len(generated_tokens)
             generation_lengths.append(len(generated_tokens))
@@ -829,6 +848,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
+        # Optional per-token entropy channel (diffusion return_entropy),
+        # aligned/right-padded exactly like logprobs. Only attached when the
+        # engine actually produced it so consumers can treat it as optional.
+        if any_entropy:
+            return_data["entropy"] = torch.stack(entropy_list)
 
         return return_data
 
