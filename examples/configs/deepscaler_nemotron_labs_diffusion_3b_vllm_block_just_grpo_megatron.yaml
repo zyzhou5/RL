@@ -1,0 +1,55 @@
+# BlockJustGRPO on DeepScaleR with SYNC vLLM generation (colocated, sync GRPO).
+#
+# The "sync cell" of the DeepScaleR backend/scheduling matrix: identical
+# trainer setup and 16-node colocated topology as the SGLang production config
+# it inherits, with only the generation backend swapped to vLLM (sync engine).
+# Exists primarily to decompose the observed step-time difference between
+# block_just_grpo_3b_bs16_leftmost_opt3_dpsync (SGLang sync, old Bridge) and
+# deepscaler_bjg_3b_vllm_asyncgrpo (vLLM async, current Bridge):
+#   policy_training delta -> trainer stack (Bridge/env vintage)
+#   generation-off-path delta -> async architecture
+# Generation section mirrors the validated gsm8k/sudoku sync-vLLM configs.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron.yaml"
+
+policy:
+  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B-official"
+
+  logprob_estimation:
+    exclude_mask_token_from_logits: false
+
+  generation:
+    backend: "vllm"
+    stop_token_ids: [11]
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.55
+      max_model_len: ${policy.max_total_sequence_length}
+      enforce_eager: True
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: false
+      vllm_metrics_logger_interval: 0.5
+    vllm_kwargs:
+      attention_backend: "TRITON_ATTN"
+      max_num_seqs: 32
+      kernel_config:
+        enable_flashinfer_autotune: false
+      diffusion_config:
+        temperature: 1.0
+        selection_policy: "leftmost"
+        canvas_length: 16
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-block_just_grpo-deepscaler-megatron-vllm-sync"
+
+logger:
+  log_dir: "logs/grpo-nd3b-block_just_grpo-deepscaler-vllm-sync"
+  wandb:
+    name: "grpo-nd3b-block_just_grpo-deepscaler-vllm-sync"

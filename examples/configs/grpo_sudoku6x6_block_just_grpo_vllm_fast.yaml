@@ -1,0 +1,27 @@
+# Block JustGRPO-Fast on Nemotron-Labs-Diffusion-3B, 6x6 Sudoku, vLLM generation.
+#
+# Entropy-sparsified child of the vLLM Block JustGRPO sudoku config: keep only
+# the top-50% highest-entropy within-block offsets
+# (fast_entropy_level_ratio=0.5 -> m=ceil(0.5*16)=8 reveal levels / forward
+# passes instead of 16; the SGLang sudoku fast variant ran 0.25).
+# vllm_kwargs.diffusion_config.return_entropy makes the vLLM engine emit each
+# token's at-unmask entropy through the logprobs channel; the generation
+# worker requests logprobs=1 and surfaces it as the optional
+# GenerationOutputSpec "entropy" channel that the offset selection consumes.
+defaults: "grpo_sudoku6x6_block_just_grpo_vllm.yaml"
+
+policy:
+  logprob_estimation:
+    fast_entropy_level_ratio: 0.5
+  generation:
+    vllm_kwargs:
+      diffusion_config:
+        return_entropy: true
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-block_just_grpo-fast-sudoku6x6-megatron-vllm"
+
+logger:
+  log_dir: "logs/grpo-nd3b-block_just_grpo-fast-sudoku6x6-vllm"
+  wandb:
+    name: "grpo-nd3b-block_just_grpo-fast-sudoku6x6-vllm"
