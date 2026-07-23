@@ -189,6 +189,24 @@ def _same_position_logprobs(
         local_exclude_index = exclude_token_id - vocab_start_index
 
     logprob_chunk_size = cfg.get("logprob_chunk_size", None)
+    # TODO(perf): the mask-exclusion logprob path below is ~2x slower than the
+    # non-exclude path (measured policy_training 165s vs 85s at DeepScaleR /
+    # 16-node). It clones the full-vocab logits and calls the plain
+    # DistributedLogprob once per sequence chunk, which fragments the op into
+    # many small autograd nodes and retains an extra full-vocab clone through
+    # the backward -- instead of the memory-efficient ChunkedDistributedLogprob
+    # (which recomputes softmax per chunk in backward and never materializes a
+    # whole fp32 logits tensor). Proper fix: add exclude_token_id support to
+    # ChunkedDistributedLogprob (mask the per-chunk fp32 upcast in its forward
+    # and backward, on the rank that owns the id) and route exclusion through it,
+    # mirroring the non-exclude dispatch -- that recovers both the speed and the
+    # memory bound. Until then, chunked logprobs + exclusion is unsupported:
+    if exclude_token_id is not None and logprob_chunk_size is not None:
+        raise NotImplementedError(
+            "logprob_chunk_size (ChunkedDistributedLogprob) is not supported on "
+            "the mask-exclusion logprob path. Unset logprob_chunk_size, or add "
+            "exclude_token_id support to ChunkedDistributedLogprob."
+        )
     target_ids = target_ids.to(device=logits.device, dtype=torch.long)
     # Branch on the GLOBAL exclude_token_id, not the per-rank local_exclude_index:
     # under TP>1 the exclude token lives in only one rank's vocab shard, so keying the
