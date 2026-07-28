@@ -27,7 +27,14 @@ from megatron.training.utils import get_ltor_masks_and_position_ids
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
+from nemo_rl.distributed.model_utils import (
+    _get_segmented_tokens_on_this_cp_rank,
+    _get_tokens_on_this_cp_rank,
+)
+from nemo_rl.models.megatron.cp_block_aware import (
+    assert_block_aware_divisible,
+    block_aware_segments,
+)
 from nemo_rl.models.megatron.common import _round_up_to_multiple
 
 
@@ -277,18 +284,37 @@ def process_microbatch(
             # the logits are re-gathered across CP in the post-processor.
             cp_size = get_context_parallel_world_size()
             if cp_size > 1:
-                assert input_ids.shape[1] % (2 * cp_size) == 0, (
-                    f"Unpacked context parallelism requires the sequence length "
-                    f"({input_ids.shape[1]}) to be divisible by 2*cp_size "
-                    f"({2 * cp_size}). Set policy.make_sequence_length_divisible_by "
-                    f"to a multiple of {2 * cp_size}."
-                )
-                input_ids_cp_sharded = _get_tokens_on_this_cp_rank(
-                    input_ids,
-                    get_context_parallel_rank(),
-                    cp_size,
-                    seq_dim=1,
-                )
+                # Block-aware CP shards the [noisy | clean] layout with one
+                # zigzag PER SEGMENT rather than one global zigzag, so the noisy
+                # K/V can stay on its owning rank. The two layouts assign
+                # different rows to a rank, so this must agree with the
+                # attention layer and the logprob re-gather; block_aware_segments
+                # is the single switch all three consult.
+                segments = block_aware_segments(data_dict)
+                if segments is not None:
+                    assert_block_aware_divisible(
+                        segments, cp_size, input_ids.shape[1]
+                    )
+                    input_ids_cp_sharded = _get_segmented_tokens_on_this_cp_rank(
+                        input_ids,
+                        segments,
+                        get_context_parallel_rank(),
+                        cp_size,
+                        seq_dim=1,
+                    )
+                else:
+                    assert input_ids.shape[1] % (2 * cp_size) == 0, (
+                        f"Unpacked context parallelism requires the sequence length "
+                        f"({input_ids.shape[1]}) to be divisible by 2*cp_size "
+                        f"({2 * cp_size}). Set policy.make_sequence_length_divisible_by "
+                        f"to a multiple of {2 * cp_size}."
+                    )
+                    input_ids_cp_sharded = _get_tokens_on_this_cp_rank(
+                        input_ids,
+                        get_context_parallel_rank(),
+                        cp_size,
+                        seq_dim=1,
+                    )
             else:
                 input_ids_cp_sharded = input_ids
             attention_mask, _, position_ids = get_ltor_masks_and_position_ids(

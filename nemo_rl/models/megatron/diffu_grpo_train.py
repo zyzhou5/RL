@@ -24,12 +24,15 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import calculate_kl
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.megatron.cp_block_aware import block_aware_segments
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedLogprob,
     ChunkedDistributedLogprobWithSampling,
     DistributedLogprob,
     DistributedLogprobWithSampling,
+    _get_segmented_tokens_on_this_cp_rank,
     _get_tokens_on_this_cp_rank,
+    allgather_segmented_cp_sharded_tensor,
     allgather_cp_sharded_tensor,
 )
 from nemo_rl.models.megatron.train import LogprobsPostProcessor, LossPostProcessor
@@ -297,6 +300,7 @@ def _cp_sharded_same_position_logprobs(
     sampling_params: Optional[TrainingSamplingParams],
     inference_only: bool,
     exclude_token_id: Optional[int],
+    segments: Optional[tuple[int, int]] = None,
 ) -> torch.Tensor:
     """Per-position logprobs under unpacked CP without materializing full logits.
 
@@ -307,11 +311,19 @@ def _cp_sharded_same_position_logprobs(
     valid: every CP rank computes the identical loss from the replicated
     ``[B, S]`` logprobs. No-op wrapper at cp_size == 1.
     """
+    # ``segments`` selects the block-aware (per-segment zigzag) layout. The
+    # target slicing and the re-gather must use the SAME split as the data
+    # path and attention, or the logprobs silently come from wrong tokens.
     cp_size = get_context_parallel_world_size()
     if cp_size > 1:
-        target_ids = _get_tokens_on_this_cp_rank(
-            target_ids, get_context_parallel_rank(), cp_size, seq_dim=1
-        )
+        if segments is not None:
+            target_ids = _get_segmented_tokens_on_this_cp_rank(
+                target_ids, segments, get_context_parallel_rank(), cp_size, seq_dim=1
+            )
+        else:
+            target_ids = _get_tokens_on_this_cp_rank(
+                target_ids, get_context_parallel_rank(), cp_size, seq_dim=1
+            )
     token_logprobs = _same_position_logprobs(
         output_tensor,
         target_ids,
@@ -321,9 +333,14 @@ def _cp_sharded_same_position_logprobs(
         exclude_token_id=exclude_token_id,
     )
     if cp_size > 1:
-        token_logprobs = allgather_cp_sharded_tensor(
-            token_logprobs, get_context_parallel_group(), seq_dim=1
-        )
+        if segments is not None:
+            token_logprobs = allgather_segmented_cp_sharded_tensor(
+                token_logprobs, segments, get_context_parallel_group(), seq_dim=1
+            )
+        else:
+            token_logprobs = allgather_cp_sharded_tensor(
+                token_logprobs, get_context_parallel_group(), seq_dim=1
+            )
     return token_logprobs
 
 
@@ -371,6 +388,7 @@ class DiffuGRPOLossPostProcessor(LossPostProcessor):
             token_logprobs = _cp_sharded_same_position_logprobs(
                 output_tensor,
                 data_dict["diffu_grpo_target_ids"],
+                segments=block_aware_segments(data_dict),
                 cfg=self.cfg,
                 sampling_params=self.sampling_params,
                 inference_only=False,
@@ -405,6 +423,7 @@ class DiffuGRPOLossPostProcessor(LossPostProcessor):
                 curr_logprobs_unfiltered = _cp_sharded_same_position_logprobs(
                     output_tensor,
                     data_dict["diffu_grpo_target_ids"],
+                    segments=block_aware_segments(data_dict),
                     cfg=self.cfg,
                     sampling_params=None,
                     inference_only=False,
@@ -530,6 +549,7 @@ class DiffuGRPOLogprobsPostProcessor(LogprobsPostProcessor):
             token_logprobs = _cp_sharded_same_position_logprobs(
                 output_tensor,
                 data_dict["diffu_grpo_target_ids"],
+                segments=block_aware_segments(data_dict),
                 cfg=self.cfg,
                 sampling_params=self.sampling_params,
                 inference_only=True,

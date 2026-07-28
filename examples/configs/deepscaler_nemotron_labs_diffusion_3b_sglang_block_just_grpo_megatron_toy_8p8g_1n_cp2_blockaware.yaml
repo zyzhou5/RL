@@ -1,0 +1,33 @@
+# BlockJustGRPO 1-node smoke with BLOCK-AWARE context parallelism at cp=2
+# (stage (b) of plans/cp_kv_sharding_blockaware_ring.md).
+#
+# Identical to its parent except for the two keys below, so a diff against the
+# cp=1 baseline run isolates context parallelism.
+#
+# Block-aware CP gives the noisy and clean sections of the [noisy | clean]
+# layout one zigzag each and all-gathers ONLY the clean K/V, so the noisy K/V
+# never leaves its owning rank and per-rank KV_LEN drops from N+C to N/cp+C.
+#
+# The layout is selected by the DIFFU_CP_BLOCK_AWARE environment variable, which
+# BOTH the NeMo-RL data path and the Megatron-Bridge attention layer read. It is
+# not a config key on purpose: the two must agree, and if they disagreed nothing
+# would raise -- the logprobs would simply come from the wrong tokens. Pass it at
+# submit time:
+#
+#   EXTRA_CONFIG_OVERRIDES='+policy.megatron_cfg.env_vars.DIFFU_CP_BLOCK_AWARE=enable'
+#
+# Use a word, not 1/true: OmegaConf coerces those to int/bool and Ray then
+# rejects runtime_env["env_vars"], which requires Dict[str, str].
+#
+# Divisibility (asserted, with messages naming the knob): at cp=2 / block_size 16
+# the noisy segment must be a multiple of 64 and the clean segment of 4. The
+# batch builder pads each segment to its own multiple; a single global pad does
+# not imply either.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron_toy_8p8g_1n.yaml"
+
+policy:
+  megatron_cfg:
+    context_parallel_size: 2
+    # Unpacked CP is gated off by default; the diffusion asymmetric path handles
+    # CP inside attention rather than through sequence packing.
+    allow_unpacked_context_parallel: true

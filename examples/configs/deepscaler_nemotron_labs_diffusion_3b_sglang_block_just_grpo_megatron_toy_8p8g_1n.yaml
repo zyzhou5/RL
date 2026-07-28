@@ -1,0 +1,22 @@
+# BlockJustGRPO 1-node smoke (8 prompts x 8 gens), shared base for the
+# block-aware CP comparison.
+#
+# The toy_8p8g config shrinks the BATCH but inherits cluster.num_nodes: 16 from
+# the production config, so it needs a 16-node allocation. This pins a single
+# node and shortens max_new_tokens for a fast read, following the pattern in
+# ..._toy_8p8g_k2.yaml.
+#
+# 512 is divisible by the FastDiffuser block_size (16); a non-multiple crashes
+# generation in rotary_embedding with a view/stride error.
+#
+# Exists so the cp=1 baseline and the cp=2 block-aware run differ in NOTHING but
+# context parallelism -- any other difference would muddy the comparison.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron_toy_8p8g.yaml"
+
+policy:
+  generation:
+    max_new_tokens: 512
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8

@@ -1172,6 +1172,23 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
             torch.cuda.empty_cache()
 
+    def reset_peak_memory_stats(self) -> None:
+        """Reset the CUDA peak-memory counter on this worker.
+
+        Used by the train bench to attribute the peak to a single measured
+        iteration rather than to init or to a previous layout.
+        """
+        torch.cuda.reset_peak_memory_stats()
+
+    def get_memory_stats(self) -> dict[str, float]:
+        """Current and peak CUDA memory on this worker, in GiB."""
+        return {
+            "allocated_gb": torch.cuda.memory_allocated() / 2**30,
+            "max_allocated_gb": torch.cuda.max_memory_allocated() / 2**30,
+            "reserved_gb": torch.cuda.memory_reserved() / 2**30,
+            "max_reserved_gb": torch.cuda.max_memory_reserved() / 2**30,
+        }
+
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload the optimizer and buffers to the CPU."""

@@ -1,0 +1,19 @@
+# BlockJustGRPO 1-node smoke with BLOCK-AWARE context parallelism at cp=4.
+#
+# Same as the cp=2 variant but with twice the CP width, which matters because
+# the divisibility gets stricter as cp grows: at block_size 16 the noisy segment
+# must now be a multiple of 2*cp*block_size = 128 (it was 64 at cp=2) and the
+# clean segment a multiple of 8. If the segment-aware padding in the batch
+# builder is subtly wrong, cp=4 is where it shows up first.
+#
+# Data parallel width drops to 8/4 = 2, so with train_global_batch_size 64 each
+# DP rank sees 32 samples.
+#
+# Needs DIFFU_CP_BLOCK_AWARE at submit time; see the cp=2 config for why it is
+# an env var rather than a config key, and why it must be a word not 1/true.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron_toy_8p8g_1n.yaml"
+
+policy:
+  megatron_cfg:
+    context_parallel_size: 4
+    allow_unpacked_context_parallel: true
