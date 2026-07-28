@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Sequence
 from typing import Any, Optional
 
 import torch
@@ -1315,6 +1316,22 @@ def gather_cp_sharded_logits(output_tensor: torch.Tensor) -> torch.Tensor:
     cp_size = get_context_parallel_world_size()
     if cp_size <= 1:
         return output_tensor
+
+    # This undoes ONE GLOBAL zigzag. Block-aware CP shards per segment instead,
+    # so a caller still on this path under that flag would re-gather with the
+    # wrong inverse and silently mis-attribute every logprob. Fail instead:
+    # the diffusion GRPO family routes through diffu_grpo_train, which uses the
+    # segmented re-gather, but just_grpo_train (plain leftmost reveal) does not.
+    from nemo_rl.models.megatron.cp_block_aware import block_aware_cp_enabled
+
+    if block_aware_cp_enabled():
+        raise NotImplementedError(
+            "DIFFU_CP_BLOCK_AWARE is set, but this code path re-gathers a single "
+            "global zigzag. Block-aware CP shards [noisy | clean] per segment, so "
+            "this would reconstruct the sequence in the wrong order. Only the "
+            "DiffuGRPO/block-JustGRPO post-processors (diffu_grpo_train.py) "
+            "support block-aware CP; unset the flag for this algorithm."
+        )
     return allgather_cp_sharded_tensor(
         output_tensor, get_context_parallel_group(), seq_dim=1
     )
@@ -1325,6 +1342,11 @@ class AllGatherCPTensor(torch.autograd.Function):
         ctx, tensor, cp_group: torch.distributed.ProcessGroup, seq_dim=1
     ):  # , unpadded_seqlen: Optional[int] = None):
         cp_size = torch.distributed.get_world_size(cp_group)
+        # NCCL rejects non-contiguous tensors ("Tensors must be contiguous").
+        # Callers that hand in a narrow()/slice view -- e.g. the per-segment
+        # block-aware re-gather -- would otherwise fail here. Gloo tolerates
+        # them, so this cannot be caught by a CPU-only test.
+        tensor = tensor.contiguous()
         cp_rank_chunks = []
         for _ in range(cp_size):
             cp_rank_chunks.append(torch.empty_like(tensor))
@@ -1357,6 +1379,13 @@ class AllGatherCPTensor(torch.autograd.Function):
     def backward(ctx, grad_output):
         cp_size = torch.distributed.get_world_size(ctx.cp_group)
         cp_rank = torch.distributed.get_rank(ctx.cp_group)
+        # Doubly required: all_reduce rejects non-contiguous input under NCCL,
+        # and the .view() below needs contiguity too. The incoming grad IS a
+        # strided view whenever the forward output was concatenated with other
+        # tensors -- which is exactly what the block-aware per-segment re-gather
+        # does. When the grad is already contiguous this is a no-op and the
+        # all_reduce stays in-place, preserving the previous behaviour.
+        grad_output = grad_output.contiguous()
         torch.distributed.all_reduce(grad_output, group=ctx.cp_group)
 
         # chunk the seqdim in 2*cp chunks, and select with a CP load balanced indexing
@@ -2363,3 +2392,82 @@ def all_to_all_sq2vp(
     output_tensor = output_flat.reshape(world_size * BS_local, V_local)
 
     return output_tensor
+
+
+def _get_segmented_tokens_on_this_cp_rank(
+    tensor: torch.Tensor,
+    segment_lengths: Sequence[int],
+    cp_rank: int,
+    cp_size: int,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Zigzag-shard each SEGMENT of a concatenated sequence independently.
+
+    Block-aware context parallelism (stage (b) of
+    ``plans/cp_kv_sharding_blockaware_ring.md``) splits ``[noisy | clean]`` into
+    one zigzag per segment instead of one global zigzag, so that the noisy K/V
+    -- consumed block-diagonally only -- never has to leave its owning rank.
+
+    The per-rank row SET differs from the single-zigzag layout, so every consumer
+    of the sharded sequence (attention, target ids, the logprob re-gather) must
+    use this same split or they silently disagree about which token is where.
+
+    Args:
+        tensor: Full-sequence tensor; length along ``seq_dim`` must equal
+            ``sum(segment_lengths)``.
+        segment_lengths: Per-segment full lengths, in layout order.
+        cp_rank: Context parallel rank.
+        cp_size: Context parallel size.
+        seq_dim: Sequence dimension.
+
+    Returns:
+        This rank's shard, length ``sum(segment_lengths) // cp_size``.
+    """
+    if cp_size == 1:
+        return tensor
+    total = int(sum(segment_lengths))
+    assert tensor.shape[seq_dim] == total, (
+        f"segmented CP shard: tensor length {tensor.shape[seq_dim]} along dim "
+        f"{seq_dim} does not match sum(segment_lengths)={total}"
+    )
+    chunks = []
+    offset = 0
+    for seg_len in segment_lengths:
+        seg = tensor.narrow(seq_dim, offset, seg_len)
+        chunks.append(_get_tokens_on_this_cp_rank(seg, cp_rank, cp_size, seq_dim))
+        offset += seg_len
+    return torch.cat(chunks, dim=seq_dim)
+
+
+def allgather_segmented_cp_sharded_tensor(
+    tensor: torch.Tensor,
+    segment_lengths: Sequence[int],
+    cp_group: torch.distributed.ProcessGroup,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Re-gather a SEGMENTED-zigzag-sharded tensor to the full sequence.
+
+    Inverse of :func:`_get_segmented_tokens_on_this_cp_rank`. Each segment is
+    routed through the existing single-zigzag ``AllGatherCPTensor``, so the
+    autograd behaviour (all-reduce in backward, then load-balanced select) is
+    the already-tested one rather than a second implementation.
+
+    Costs one collective per segment instead of one overall. The total bytes
+    moved are unchanged -- the segments partition the sequence -- so this is
+    extra launch latency, not extra bandwidth.
+    """
+    cp_size = torch.distributed.get_world_size(cp_group)
+    if cp_size == 1:
+        return tensor
+    parts = []
+    offset = 0
+    for seg_len in segment_lengths:
+        local_len = seg_len // cp_size
+        # .contiguous() is required, not defensive: narrow() returns a strided
+        # view into the middle of the sequence, and torch.distributed.all_gather
+        # rejects non-contiguous tensors ("Tensors must be contiguous"). The
+        # single-segment path never hits this because it passes the whole tensor.
+        segment = tensor.narrow(seq_dim, offset, local_len).contiguous()
+        parts.append(AllGatherCPTensor.apply(segment, cp_group, seq_dim))
+        offset += local_len
+    return torch.cat(parts, dim=seq_dim)
