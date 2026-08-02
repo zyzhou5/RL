@@ -1,0 +1,22 @@
+# FastDiffuser RANDOM-masking decoding for TraceGRPO at block_size=16,
+# temperature 0.6, k=2 tokens revealed per step. selection_policy: random
+# reveals k uniformly-random masked positions per step; with threshold null,
+# k comes from the even schedule over the remaining masks: FULL 16-blocks
+# commit exactly 2 tokens/step for 8 steps -> 8 trajectory levels (commit steps
+# 0..7). Partial final blocks spread their remaining masks evenly (k drops to
+# 1, possibly fewer steps), so per-sample depths can be < 8; the batch max
+# (num_levels) is 8. The force-commit sentinel is unreachable (the schedule
+# always completes the block). Position choice is independent of the model scores, so the
+# recorded reveal-step logprobs are unbiased policy logprobs, and the 2 tokens
+# committed together were produced in the same forward, so harvesting them
+# together in one training level is exact.
+# Trajectory recording unchanged: logprob_mode: trajectory + return_reveal_steps.
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 8
+causal_context: true
+temperature: 0.6
+threshold: null
+selection_policy: random
+logprob_mode: trajectory
+return_reveal_steps: true

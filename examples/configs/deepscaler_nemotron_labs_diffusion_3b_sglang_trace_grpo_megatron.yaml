@@ -1,0 +1,66 @@
+# Inference-Trajectory-Replay ("Trace") GRPO on Nemotron-Labs-Diffusion-3B,
+# DeepScaleR train / AIME 2024 val.
+#
+# Same multi-level reveal machinery as BlockJustGRPO, but the per-token reveal
+# order is taken from the actual SGLang FastDiffuser confidence-decoding
+# trajectory (the recorded commit_step) instead of the deterministic
+# leftmost-within-block schedule. Only the policy worker, the logprob estimator,
+# and the FastDiffuser logprob_mode are swapped relative to the DiffuGRPO base.
+#
+# block_size is overridden to 16 (default checkpoint is 32) and kept consistent
+# across the places it matters, mirroring the BlockJustGRPO bs16 setup: the
+# Megatron policy model (policy.hf_config_overrides.block_size -> triggers a
+# one-time HF->mcore conversion under a separate cache path), the FastDiffuser
+# decoding block (dllm_algorithm_config), and the trace logprob estimator (which
+# inherits the model's block_size). The reveal levels come from the recorded
+# commit_step directly, so no max_steps is needed on the training side.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_diffugrpo_megatron.yaml"
+
+policy:
+  worker_cls_fqn: "nemo_rl.models.policy.workers.trace_grpo_megatron_policy_worker.TraceGRPOMegatronPolicyWorker"
+
+  # Megatron policy model block size (block-diffusion attention). Overriding this
+  # re-runs the one-time HF->mcore conversion under a separate cache path.
+  hf_config_overrides:
+    block_size: 16
+
+  logprob_estimation:
+    type: "trace_grpo"
+    mask_token_id: 100
+    exclude_mask_token_from_logits: true
+    # block_size omitted -> inherits the model module config.block_size (now 16),
+    # so reveal levels stay consistent with the attention blocking.
+    # Optional cap on data-dependent reveal-level passes.
+    # max_reveal_levels: 32
+    # Stochastic level sampling: score k sampled trajectory levels per sample per
+    # step (loss reweighted by depth/k) instead of every level. Cuts the per-pass
+    # forward count from the batch-max trajectory depth (~block_size) to k.
+    # num_level_samples: 2
+
+  generation:
+    sglang_cfg:
+      # Confidence decoding with logprob_mode: trajectory so SGLang records and
+      # returns each token's block-relative commit_step (output_token_reveal_steps).
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-megatron-sglang"
+
+cluster:
+  num_nodes: 16
+
+# Trace training-stability defaults (apply to every trace run; leaves may override):
+#  * normalize_rewards false: advantage = reward - group mean, no /std.
+#  * reference_policy_kl_penalty 0.01 (k3): nonzero-gradient anchor at zero reward;
+#    needs skip_reference_policy_logprobs_calculation false so ref logprobs run.
+grpo:
+  normalize_rewards: false
+  skip_reference_policy_logprobs_calculation: false
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  reference_policy_kl_type: "k3"

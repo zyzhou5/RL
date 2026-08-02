@@ -1,0 +1,21 @@
+# TraceGRPO on Nemotron-Labs-Diffusion-3B, 4x4 Mini Sudoku.
+# Two parents: (1) the trace_grpo algorithm base (inference-trajectory-replay reveal
+# levels, FastDiffuser confidence 0.9 at block_size 16 with logprob_mode: trajectory +
+# return_reveal_steps) and (2) grpo_sudoku4x4_base.yaml (shared task settings:
+# mini_sudoku blanks-only reward, few-shot prompt, gen 512, avg@4 validation). The
+# second parent overrides the algorithm base's data/env; this file only sets output
+# paths, cluster size, and the sudoku-length microbatch bump.
+defaults:
+  - deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron.yaml
+  - grpo_sudoku4x4_base.yaml
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-sudoku4x4-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-sudoku4x4-sglang"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-sudoku4x4-blanks-fewshot"
+
+cluster:
+  num_nodes: 8

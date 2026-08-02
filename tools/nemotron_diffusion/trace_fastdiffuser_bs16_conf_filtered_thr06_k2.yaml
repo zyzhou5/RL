@@ -1,0 +1,27 @@
+# FastDiffuser CONFIDENCE-FILTERED k=2 decoding for TraceGRPO at block_size=16.
+#
+# Per denoise step: positions whose SAMPLED-token confidence >= threshold(0.6)
+# are eligible; exactly tokens_per_step(2) positions commit, chosen uniformly
+# among the eligible (via the shared per-block priority permutation when the
+# request carries a dllm_position_seed — group-shared order / CRN), with a
+# top-confidence fallback fill when fewer than k are eligible.
+#
+# vs plain confidence(thr 0.9): no threshold-driven commit count -> no
+# forced-commit cliff when entropy drifts; commits at 0.6+ restore the
+# moderate-confidence exploratory tail; resampling-per-step means sub-0.6
+# off-variant samples wait and resample instead of committing (fewer icepop
+# min-bound outliers). 16 masks / k=2 = 8 denoise steps per block (max_steps
+# 16 leaves slack for EOS-freeze paths).
+#
+# Same trajectory recording as trace_fastdiffuser_bs16.yaml: logprob_mode
+# trajectory + return_reveal_steps for the trace replay estimator.
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 16
+causal_context: true
+temperature: 1.0
+threshold: 0.6
+selection_policy: confidence_filtered
+tokens_per_step: 2
+logprob_mode: trajectory
+return_reveal_steps: true

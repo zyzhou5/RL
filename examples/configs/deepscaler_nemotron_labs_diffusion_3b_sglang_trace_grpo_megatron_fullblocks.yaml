@@ -1,0 +1,25 @@
+# TraceGRPO on Nemotron-Labs-Diffusion-3B, DeepScaleR train / AIME 2024 val,
+# with emit_full_blocks generation. Responses are NOT trimmed at the first
+# positional EOS -- the whole final block (post-EOS commits + propagated EOS) is
+# returned with logprobs/reveal steps for every token, so the trace replay
+# conditions the terminal EOS on the exact decode-time context (removes the EOS
+# trim-loss bias; see analyze_trace_eos_parity.py). Post-first-EOS tokens are
+# context-only in training: revealed and score-harvested so their logprobs are
+# computed (parity), but excluded from the loss and from the token normalizer
+# (build_trace_base / make_trace_level_view / _valid_toks_correction). Only the
+# FastDiffuser dllm config is swapped relative to the standard deepscaler trace
+# config.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron.yaml"
+
+policy:
+  generation:
+    sglang_cfg:
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_fullblocks.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-fullblocks-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-fullblocks-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-fullblocks-megatron-sglang"

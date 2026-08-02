@@ -213,6 +213,12 @@ class GenerationOutputSpec(TypedDict):
         torch.Tensor
     )  # Length of full valid sequence (input + generated response)
     logprobs: torch.Tensor
+    reveal_steps: NotRequired[
+        torch.Tensor
+    ]  # Per-token block-relative denoising step that committed each token (Trace
+    #    JustGRPO). Backend-agnostic: SGLang emits it via FastDiffuser
+    #    logprob_mode="trajectory" + return_reveal_steps, vLLM via
+    #    diffusion_config.return_reveal_steps. Zero-filled when neither is enabled.
     truncated: NotRequired[
         torch.Tensor
     ]  # Whether each sequence was truncated and hit max_tokens without stop token

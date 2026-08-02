@@ -1,0 +1,20 @@
+# TraceGRPO on DeepScaleR: plain CONFIDENCE decoding (thr 0.9, t1.0) + icepop,
+# with emit_full_blocks -- the fullblocks re-test of the collapsed conf-t1 arm.
+# Only delta vs the icepop0812 parent (trace_dsr_icepop0812_conf_t1 config):
+# the dllm yaml swaps to the fullblocks confidence decode, so the trace replay
+# is bit-exact everywhere. Token-level loss (parent default). Isolates whether
+# exact replay changes the conf-t1 entropy-creep/threshold-cliff trajectory.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron_icepop0812.yaml"
+
+policy:
+  generation:
+    sglang_cfg:
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_fullblocks.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-conf09-fullblocks-deepscaler-icepop0812-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-conf09-fullblocks-deepscaler-icepop0812-sglang"
+  wandb:
+    name: "trace_deepscaler_conf09_fullblocks_icepop0812"

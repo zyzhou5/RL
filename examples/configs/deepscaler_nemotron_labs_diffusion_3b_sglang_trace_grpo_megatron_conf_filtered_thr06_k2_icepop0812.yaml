@@ -1,0 +1,33 @@
+# TraceGRPO on DeepScaleR: CONFIDENCE-FILTERED k=2 decode (stage-2 arm) on top
+# of the icepop [0.8,1.2] loss config.
+#
+# Deltas vs the collapsed conf-t1 arm (trace_dsr_icepop0812_conf_t1):
+#  * selection_policy confidence_filtered (thr 0.6, k=2): fixed per-step commit
+#    budget kills the threshold cliff; 0.6-eligibility restores the
+#    moderate-confidence tail (headroom for positive-advantage sharpening).
+#  * shared_position_seed: group-shared reveal order (CRN) — the eligible-set
+#    tie-break luck cancels in the group baseline where sets agree.
+#  * loss_fn.token_level_loss false (sequence-level): removes the ~10-14%
+#    net-negative advantage token-mass from wrong answers being ~40% longer —
+#    the measured entropy pump of the collapsed run.
+# Inherits confidence-t1 base (kl001-k3, normalize_rewards false, temperature
+# 1.0) + icepop bounds from the parent. Requires sglang fork with
+# confidence_filtered + CRN (>= stage-2 commit on restore/a652eb48-good-run).
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron_icepop0812.yaml"
+
+loss_fn:
+  token_level_loss: false
+
+policy:
+  generation:
+    sglang_cfg:
+      shared_position_seed: true
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_conf_filtered_thr06_k2.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-conf-filtered-thr06-k2-deepscaler-icepop0812-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-conf-filtered-thr06-k2-deepscaler-icepop0812-sglang"
+  wandb:
+    name: "trace_deepscaler_conf_filtered_thr06_k2_icepop0812"

@@ -1,0 +1,55 @@
+# TraceGRPO on Nemotron-Labs-Diffusion-3B, 6x6 Sudoku, vLLM generation with
+# RANDOM reveal order at temperature 0.6, 2 tokens/step, full-block emission.
+#
+# vLLM port of the SGLang decode in
+# tools/nemotron_diffusion/trace_fastdiffuser_bs16_random_t06_k2_fullblocks.yaml
+# (the algorithm config behind grpo_sudoku6x6_trace_grpo_random_t06_fullblocks).
+# Backend-swap child of grpo_sudoku6x6_trace_grpo_vllm.yaml: only the decode
+# policy changes; the trainer side is inherited unchanged.
+#
+#   SGLang                          vLLM diffusion_config
+#   ------------------------------  ----------------------------------------
+#   block_size: 16                  canvas_length: 16
+#   max_steps: 8                    max_denoising_steps: 8
+#   selection_policy: random        selection_policy: "random"
+#   temperature: 0.6                temperature: 0.6
+#   threshold: null                 (unused by the random policy)
+#   emit_full_blocks: true          emit_full_blocks: true
+#   return_reveal_steps: true       return_reveal_steps: true   (inherited)
+#   logprob_mode: trajectory        (no analogue -- vLLM logprobs are already
+#                                    captured at unmask time)
+#
+# "k=2" is NOT a separate knob in either engine: it falls out of the even
+# transfer schedule, k = ceil(remaining_masks / remaining_steps) = 16/8 = 2
+# at every step. This is why the SGLang k2 config sets max_steps 8 rather
+# than a tokens_per_step field.
+#
+# policy.generation.temperature is set to 0.6 as well, mirroring the SGLang
+# t06 parent: it keeps the per-request sampling params non-greedy AND is what
+# the Megatron recompute tempers its logits by, so the training distribution
+# matches the distribution the rollout logprobs were recorded under.
+defaults: "grpo_sudoku6x6_trace_grpo_vllm.yaml"
+
+policy:
+  generation:
+    temperature: 0.6
+    vllm_kwargs:
+      diffusion_config:
+        temperature: 0.6
+        selection_policy: "random"
+        canvas_length: 16
+        # k = ceil(16 / 8) = 2 unmasked positions per denoising step.
+        max_denoising_steps: 8
+        # Keep the whole block a stop token lands in: under random reveal the
+        # EOS can be committed before positions revealed earlier in the
+        # trajectory, and trimming there would drop the decoder's own history.
+        emit_full_blocks: true
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-random-t06-k2-fullblocks-sudoku6x6-vllm"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-random-t06-k2-fullblocks-sudoku6x6-vllm"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-random-t06-k2-fullblocks-sudoku6x6-vllm"

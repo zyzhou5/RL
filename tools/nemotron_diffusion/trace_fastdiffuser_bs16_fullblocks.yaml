@@ -1,0 +1,16 @@
+# FastDiffuser CONFIDENCE decoding for TraceGRPO at block_size=16, plus
+# emit_full_blocks: responses are NOT trimmed at the first positional EOS -- the
+# whole final block (post-EOS commits + propagated EOS) is returned with
+# logprobs/reveal steps for every token, so the trace replay conditions the
+# terminal EOS on the exact decode-time context. Same confidence (threshold 0.9,
+# temperature 1.0) decoding as trace_fastdiffuser_bs16.yaml otherwise.
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 16
+causal_context: true
+temperature: 1.0
+threshold: 0.9
+selection_policy: confidence
+logprob_mode: trajectory
+return_reveal_steps: true
+emit_full_blocks: true

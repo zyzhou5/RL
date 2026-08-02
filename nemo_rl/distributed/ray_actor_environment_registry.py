@@ -17,7 +17,12 @@ import os
 from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
 
 USE_SYSTEM_EXECUTABLE = os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1"
-VLLM_EXECUTABLE = (
+# NRL_VLLM_PY_EXECUTABLE: absolute path to a pre-provisioned python for the
+# vLLM generation workers only (e.g. a venv carrying a custom vLLM fork). A
+# plain path (non-"uv" string) is used directly as the Ray py_executable, so
+# no per-actor venv is built. Also skips the vLLM source monkey-patches in
+# vllm_worker.py.
+VLLM_EXECUTABLE = os.environ.get("NRL_VLLM_PY_EXECUTABLE") or (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.VLLM
 )
 SGLANG_EXECUTABLE = (
@@ -40,6 +45,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.policy.workers.block_just_grpo_megatron_policy_worker.BlockJustGRPOMegatronPolicyWorker": MCORE_EXECUTABLE,
     "nemo_rl.models.policy.workers.coupled_grpo_megatron_policy_worker.CoupledGRPOMegatronPolicyWorker": MCORE_EXECUTABLE,
     "nemo_rl.models.policy.workers.espo_megatron_policy_worker.ESPOMegatronPolicyWorker": MCORE_EXECUTABLE,
+    "nemo_rl.models.policy.workers.trace_grpo_megatron_policy_worker.TraceGRPOMegatronPolicyWorker": MCORE_EXECUTABLE,
     "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.math_environment.MathMultiRewardEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.vlm_environment.VLMEnvironment": PY_EXECUTABLES.SYSTEM,
@@ -48,7 +54,10 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.reasoning_gym_environment.ReasoningGymEnvironment": PY_EXECUTABLES.SYSTEM,
-    # AsyncTrajectoryCollector needs vLLM environment to handle exceptions from VllmGenerationWorker
+    # AsyncTrajectoryCollector needs vLLM importable for worker exception types,
+    # plus the FULL nemo_rl algorithms import closure (torchdata etc.) -> it must
+    # run on the stock uv vLLM env, NOT a custom NRL_VLLM_PY_EXECUTABLE runtime
+    # (those only carry engine deps; the collector never runs an engine).
     "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": PY_EXECUTABLES.VLLM,
     # ReplayBuffer needs vLLM environment to handle trajectory data from VllmGenerationWorker
     "nemo_rl.algorithms.async_utils.ReplayBuffer": PY_EXECUTABLES.VLLM,

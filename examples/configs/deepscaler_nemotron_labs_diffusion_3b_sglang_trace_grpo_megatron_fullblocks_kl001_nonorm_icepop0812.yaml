@@ -1,0 +1,42 @@
+# TraceGRPO on DeepScaleR, random t0.6 k2, emit_full_blocks, kl001 nonorm
+#   + icepop token-level importance-sampling filter on bounds [0.8, 1.2].
+# DeepScaleR analog of gsm8k_..._trace_grpo_megatron_fullblocks_kl001_nonorm_icepop0812.yaml
+# and grpo_sudoku6x6_trace_grpo_random_t06_fullblocks_kl001_nonorm_icepop0812.yaml.
+#
+# Filters (zeros from the loss) tokens whose SGLang/Megatron ratio
+#   exp(prev_logprob - generation_logprob)
+# falls outside [0.8, 1.2]  (~ prev-gen outside (-0.223, +0.182) nats) -- i.e. tokens where the
+# training policy (prev) disagrees with the rollout-generation policy (gen). These are exactly
+# the trace-estimator mis-scores (dominated by gen>>prev, caught by the MIN bound 0.8) that
+# corrupt the gradient and drive the collapse.
+#
+# icepop zeros the IS weight of out-of-band tokens (dropped) and keeps the raw BOUNDED IS weight
+# (within [0.8,1.2]) on in-band survivors, so use_importance_sampling_correction MUST be true
+# (the loss asserts it). This is the FILTER-based mitigation, distinct from the on-policy arm
+# (force_on_policy_ratio, which forces ratio=1.0 and drops prev_logprobs) -- so force_on_policy_ratio
+# stays OFF here; icepop needs the real prev/gen ratio.
+#
+# Inherits kl001 (k3) + normalize_rewards false + t0.6 + cluster.num_nodes 16 from the trace base;
+# swaps only the FastDiffuser rollout dllm config to the emit_full_blocks variant (exact EOS-block
+# conditioning, responses are block multiples; inherited max_new_tokens 3744 = 234*16 stays
+# block-divisible) to match the sudoku/gsm8k icepop arms.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron_t06_random.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "icepop"
+  truncated_importance_sampling_ratio: 1.2        # max bound: drops prev >> gen
+  truncated_importance_sampling_ratio_min: 0.8    # min bound: drops gen >> prev
+
+policy:
+  generation:
+    sglang_cfg:
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_random_t06_k2_fullblocks.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-random-t06-deepscaler-fullblocks-kl001-nonorm-icepop0812-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-random-t06-deepscaler-fullblocks-kl001-nonorm-icepop0812-sglang"
+  wandb:
+    name: "trace_deepscaler_fb_kl001_nonorm_icepop0812"

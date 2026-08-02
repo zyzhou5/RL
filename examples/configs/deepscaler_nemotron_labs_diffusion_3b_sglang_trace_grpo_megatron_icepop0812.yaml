@@ -1,0 +1,26 @@
+# TraceGRPO on Nemotron-Labs-Diffusion-3B, DeepScaleR train / AIME 2024 val:
+# confidence unmasking at temperature 1.0 (inherits the confidence-t1 base, which
+# also carries the trace-wide kl001-k3 + normalize_rewards-false defaults), plus
+# the icepop token-level truncated-importance-sampling clamp on [0.8, 1.2]. icepop
+# zeros the IS weight of out-of-band tokens (dropped) and keeps the raw BOUNDED IS
+# weight on in-band survivors, so use_importance_sampling_correction MUST be true.
+# This bounds the exp(prev - gen) outliers that drive the trace reward collapse.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "icepop"
+  truncated_importance_sampling_ratio: 1.2        # max bound: drops prev >> gen
+  truncated_importance_sampling_ratio_min: 0.8    # min bound: drops gen >> prev
+
+policy:
+  generation:
+    temperature: 1.0
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-icepop0812-megatron"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-icepop0812-megatron-sglang"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-icepop0812-megatron-sglang"

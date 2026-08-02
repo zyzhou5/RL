@@ -18,9 +18,11 @@ import multiprocessing
 import socket
 import os
 import time
+import zlib
 from typing import Any, Optional
 
 import aiohttp
+import numpy as np
 import ray
 import requests
 import torch
@@ -72,10 +74,23 @@ def _choose_sglang_port(
 
 def _extract_generated_tokens_and_logprobs(
     result: dict[str, Any],
-) -> tuple[list[int], list[float]]:
-    """Extract generated token IDs and logprobs from an SGLang /generate response."""
+) -> tuple[list[int], list[float], list[int]]:
+    """Extract generated token IDs, logprobs, and reveal steps from a /generate response.
+
+    reveal_steps is the per-token block-relative denoising step that committed
+    each token, surfaced only by FastDiffuser logprob_mode="trajectory" (the
+    "Trace" JustGRPO baseline). It is aligned to new_tokens; when SGLang did
+    not return it (any other generation mode) it is filled with zeros so callers
+    can always build a dense per-token tensor.
+    """
     meta_info = result.get("meta_info", {})
     output_token_logprobs = meta_info.get("output_token_logprobs", [])
+    reveal_steps_raw = meta_info.get("output_token_reveal_steps", [])
+
+    def _align_reveal_steps(new_tokens: list[int]) -> list[int]:
+        if reveal_steps_raw and len(reveal_steps_raw) == len(new_tokens):
+            return [int(x) for x in reveal_steps_raw]
+        return [0] * len(new_tokens)
 
     if output_token_logprobs:
         new_tokens = []
@@ -94,7 +109,7 @@ def _extract_generated_tokens_and_logprobs(
                 )
             new_tokens.append(int(token_id))
             new_logprobs.append(float(logprob))
-        return new_tokens, new_logprobs
+        return new_tokens, new_logprobs, _align_reveal_steps(new_tokens)
 
     output_ids = result.get("output_ids", meta_info.get("output_ids", []))
     output_token_logprobs_val = meta_info.get(
@@ -113,9 +128,12 @@ def _extract_generated_tokens_and_logprobs(
                 f"{len(new_tokens)} token ids vs "
                 f"{len(output_token_logprobs_val)} logprobs"
             )
-        return [int(x) for x in new_tokens], [
-            float(x) for x in output_token_logprobs_val
-        ]
+        new_tokens = [int(x) for x in new_tokens]
+        return (
+            new_tokens,
+            [float(x) for x in output_token_logprobs_val],
+            _align_reveal_steps(new_tokens),
+        )
 
     if output_ids:
         logger.warning(
@@ -123,9 +141,10 @@ def _extract_generated_tokens_and_logprobs(
             "generation_logprobs with zeros. This is expected for some DLLM "
             "generation modes whose behavior logprobs are recomputed later."
         )
-        return [int(x) for x in output_ids], [0.0] * len(output_ids)
+        new_tokens = [int(x) for x in output_ids]
+        return new_tokens, [0.0] * len(new_tokens), _align_reveal_steps(new_tokens)
 
-    return [], []
+    return [], [], []
 
 
 def _require_sglang():
@@ -234,6 +253,15 @@ class SGLangGenerationWorker:
         self.is_model_owner = bundle_indices is not None
         self.global_rank = int(os.environ.get("RANK", "0"))
         self.sglang_cfg = config["sglang_cfg"]
+        # Shared position-order (CRN) for dLLM decoding: when enabled, every
+        # request carries a "dllm_position_seed" derived from a hash of its
+        # prompt token ids. All GRPO rollouts of one prompt group share the
+        # prompt, hence the seed, hence the FastDiffuser reveal order — even
+        # when the group is sharded across DP generation servers. Position
+        # randomness only; token sampling stays independent per rollout.
+        self.shared_position_seed = bool(
+            self.sglang_cfg.get("shared_position_seed", False)
+        )
 
         # Create a dedicated event loop thread for async operations
         # there will be issues if we use the event loop in the main thread
@@ -554,7 +582,7 @@ class SGLangGenerationWorker:
         input_ids: list[int],
         sampling_params: dict[str, Any],
         stop_string: Optional[str] = None,
-    ) -> tuple[list[int], list[float]]:
+    ) -> tuple[list[int], list[float], list[int]]:
         """Generate a single sample using SGLang API (async function).
 
         Args:
@@ -563,9 +591,11 @@ class SGLangGenerationWorker:
             stop_string: Optional stop string for this sample
 
         Returns:
-            Tuple of (generated_tokens, logprobs):
+            Tuple of (generated_tokens, logprobs, reveal_steps):
                 - generated_tokens: List of generated token IDs
                 - logprobs: List of log probabilities for generated tokens
+                - reveal_steps: Per-token block-relative denoising step (0 unless
+                  FastDiffuser logprob_mode="trajectory")
         """
         # Prepare payload for SGLang API
         # Note: stop should be in sampling_params, not in payload top level
@@ -711,6 +741,7 @@ class SGLangGenerationWorker:
                 {
                     "output_ids": torch.zeros((0, 0), dtype=torch.long),
                     "logprobs": torch.zeros((0, 0), dtype=torch.float),
+                    "reveal_steps": torch.zeros((0, 0), dtype=torch.long),
                     "generation_lengths": torch.zeros(0, dtype=torch.long),
                     "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
                 }
@@ -758,6 +789,14 @@ class SGLangGenerationWorker:
                 context_length=context_length,
                 sample_index=i,
             )
+            if self.shared_position_seed:
+                # Deterministic prompt-hash seed: identical for all rollouts
+                # of the same prompt (group), across workers and DP shards.
+                sample_sampling_params["custom_params"] = {
+                    "dllm_position_seed": zlib.crc32(
+                        np.asarray(valid_input_ids, dtype=np.int64).tobytes()
+                    )
+                }
 
             tasks.append(
                 self._generate_single_sample(
@@ -773,7 +812,7 @@ class SGLangGenerationWorker:
         except Exception as e:
             raise
 
-        total_generated_tokens = sum(len(tokens) for tokens, _ in all_results)
+        total_generated_tokens = sum(len(tokens) for tokens, *_ in all_results)
         avg_generation_length = (
             total_generated_tokens / batch_size if batch_size > 0 else 0
         )
@@ -781,12 +820,13 @@ class SGLangGenerationWorker:
         # Process results
         output_ids_list = []
         logprobs_list = []
+        reveal_steps_list = []
         generation_lengths_list = []
         unpadded_sequence_lengths_list = []
         max_length = 0
 
         # First pass: calculate max_length
-        for i, (new_tokens, new_logprobs) in enumerate(all_results):
+        for i, (new_tokens, new_logprobs, new_reveal_steps) in enumerate(all_results):
             input_len = input_lengths[i].item()
             generation_length = len(new_tokens)
             unpadded_length = input_len + generation_length
@@ -794,7 +834,7 @@ class SGLangGenerationWorker:
 
         total_length = max(max_length, padded_input_length)
 
-        for i, (new_tokens, new_logprobs) in enumerate(all_results):
+        for i, (new_tokens, new_logprobs, new_reveal_steps) in enumerate(all_results):
             input_len = input_lengths[i].item()
             generation_length = len(new_tokens)
             unpadded_length = input_len + generation_length
@@ -817,14 +857,25 @@ class SGLangGenerationWorker:
                     position = input_len + idx
                     full_logprobs[position] = logprob
 
+            # Construct reveal_steps parallel to logprobs: zeros for input tokens,
+            # the per-token block-relative denoising step for generated tokens
+            # (all zeros unless FastDiffuser logprob_mode="trajectory").
+            full_reveal_steps = torch.zeros(total_length, dtype=torch.long)
+            if new_reveal_steps:
+                for idx, step in enumerate(new_reveal_steps):
+                    position = input_len + idx
+                    full_reveal_steps[position] = step
+
             output_ids_list.append(full_output)
             logprobs_list.append(full_logprobs)
+            reveal_steps_list.append(full_reveal_steps)
             generation_lengths_list.append(generation_length)
             unpadded_sequence_lengths_list.append(unpadded_length)
 
         # Stack into tensors
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
+        reveal_steps = torch.stack(reveal_steps_list)
         generation_lengths = torch.tensor(generation_lengths_list, dtype=torch.long)
         unpadded_sequence_lengths = torch.tensor(
             unpadded_sequence_lengths_list, dtype=torch.long
@@ -838,6 +889,7 @@ class SGLangGenerationWorker:
                 "generation_lengths": generation_lengths,
                 "unpadded_sequence_lengths": unpadded_sequence_lengths,
                 "logprobs": logprobs,
+                "reveal_steps": reveal_steps,
             }
         )
 

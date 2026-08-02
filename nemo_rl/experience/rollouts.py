@@ -110,6 +110,11 @@ def generate_responses(
                 i, input_length:total_length
             ]
 
+        if "reveal_steps" in generation_outputs:
+            assistant_message["reveal_steps"] = generation_outputs["reveal_steps"][
+                i, input_length:total_length
+            ]
+
         batch["message_log"][i].append(assistant_message)
 
     # Generation metrics
@@ -209,6 +214,11 @@ async def generate_responses_async(
 
         if include_logprobs and "logprobs" in generation_outputs:
             assistant_message["generation_logprobs"] = generation_outputs["logprobs"][
+                i, input_length:total_length
+            ]
+
+        if "reveal_steps" in generation_outputs:
+            assistant_message["reveal_steps"] = generation_outputs["reveal_steps"][
                 i, input_length:total_length
             ]
 

@@ -1,0 +1,28 @@
+# TraceGRPO, 6x6 Sudoku, vLLM FULL ASYNC-GRPO with TIS (clamp-to-max) instead
+# of icepop. Child of the async-GRPO icepop config; ONLY the truncation mode
+# changes (see the sync tis config for the full rationale).
+#
+# This is the run the change is really aimed at. The icepop async run
+# (job 14503107) showed: is_oob_ratio 6.47% (vs 0.52% sync), KL ~10x sync,
+# loss swinging to -0.135, and a reward regression 0.392 -> 0.267 coinciding
+# with the KL peak. 4.15% of tokens were being zeroed from BELOW the band --
+# tokens whose lower weight is correct under one-step-stale data, not noise.
+#
+# tis @ 2.0 clamps only the 0.300% above 2.0 (max observed 9.22) and leaves
+# the entire low tail intact with its true weights.
+defaults: "grpo_sudoku6x6_trace_grpo_vllm_random_t06_k2_fullblocks_icepop0812_async_grpo.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: null
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-t06-sud6x6-fb-tis20-vllm-async-grpo"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-t06-sud6x6-fb-tis20-vllm-async-grpo"
+  wandb:
+    name: "trace_sud6x6_fb_tis20_vllm_async_grpo"

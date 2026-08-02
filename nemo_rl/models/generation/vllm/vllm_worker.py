@@ -132,6 +132,14 @@ class BaseVllmGenerationWorker:
             seed: Random seed for initialization
         """
         self.cfg = config
+        # Engine-level diffusion sampling temperature, if this is a dLLM run.
+        # vLLM denoises a whole canvas per step under an ENGINE-wide
+        # temperature, so a diffusion request's per-request temperature is only
+        # a gate (0 = greedy, non-zero = use the engine schedule) and any other
+        # value is rejected by SamplingParams._validate_diffusion.
+        self._diffusion_temperature = (
+            (self.cfg.get("vllm_kwargs") or {}).get("diffusion_config") or {}
+        ).get("temperature")
         self.model_name = self.cfg["model_name"]
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
@@ -406,11 +414,20 @@ class BaseVllmGenerationWorker:
 
             logger.info("Successfully patched hermes tool parser for thread-safety.")
 
-        _patch_vllm_init_workers_ray()
-        logger.info("Successfully patched vllm _init_workers_ray.")
+        if os.environ.get("NRL_VLLM_PY_EXECUTABLE"):
+            # Custom vLLM runtime (e.g. an editable fork checkout): do not
+            # rewrite its source files. The ray-executor patch is only needed
+            # for TP/PP>1 nested ray workers; apply the equivalent change in
+            # the custom tree deliberately if needed.
+            logger.info(
+                "NRL_VLLM_PY_EXECUTABLE set; skipping vllm source patches."
+            )
+        else:
+            _patch_vllm_init_workers_ray()
+            logger.info("Successfully patched vllm _init_workers_ray.")
 
-        _patch_vllm_llama_eagle3_own_lm_head()
-        _patch_vllm_hermes_tool_parser_thread_safety()
+            _patch_vllm_llama_eagle3_own_lm_head()
+            _patch_vllm_hermes_tool_parser_thread_safety()
 
         try:
             import vllm
@@ -600,6 +617,28 @@ class BaseVllmGenerationWorker:
 
         temperature = 0.0 if greedy else self.cfg["temperature"]
 
+        if not greedy and self._diffusion_temperature is not None and temperature > 0:
+            # Diffusion: hand vLLM the "use the engine schedule" sentinel (1.0)
+            # rather than the configured value, which it would reject.
+            #
+            # The two must still agree numerically: the rollout logprobs are
+            # recorded under logits / diffusion_config.temperature, while the
+            # Megatron recompute tempers by generation.temperature
+            # (megatron_policy_worker.py). If they diverge, the training
+            # distribution silently stops matching the behavior distribution
+            # and the generation-KL error blows up -- so fail loudly here
+            # instead.
+            if abs(float(self._diffusion_temperature) - float(temperature)) > 1e-6:
+                raise ValueError(
+                    "Diffusion generation temperature mismatch: "
+                    f"policy.generation.temperature={temperature} but "
+                    "policy.generation.vllm_kwargs.diffusion_config.temperature="
+                    f"{self._diffusion_temperature}. The engine samples at the "
+                    "diffusion_config value while the trainer tempers by "
+                    "generation.temperature; set both to the same number."
+                )
+            temperature = 1.0
+
         max_tokens = (
             max_new_tokens if max_new_tokens is not None else self.cfg["max_new_tokens"]
         )
@@ -712,6 +751,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 {
                     "output_ids": torch.zeros((0, 0), dtype=torch.long),
                     "logprobs": torch.zeros((0, 0), dtype=torch.float),
+                    "reveal_steps": torch.zeros((0, 0), dtype=torch.long),
                     "generation_lengths": torch.zeros(0, dtype=torch.long),
                     "unpadded_sequence_lengths": torch.zeros(0, dtype=torch.long),
                     "truncated": torch.zeros(0, dtype=torch.bool),
@@ -745,6 +785,7 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
+        reveal_steps_list = []
         generation_lengths = []
         unpadded_sequence_lengths = []
         truncated_list = []  # Track if response was truncated (hit max_tokens)
@@ -791,6 +832,22 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
             logprobs_list.append(full_logprobs)
 
+            # Diffusion reveal-step channel (vLLM diffusion_config
+            # return_reveal_steps): CompletionOutput.reveal_steps is a plain
+            # list[int] parallel to token_ids -- the structural twin of SGLang's
+            # meta_info["output_token_reveal_steps"]. Build the same
+            # zeros-for-input / step-for-generated layout the SGLang worker
+            # produces, so downstream code stays backend-agnostic. None for
+            # every non-diffusion model and whenever the channel is off.
+            full_reveal_steps = torch.zeros(total_length, dtype=torch.long)
+            gen_reveal_steps = getattr(generation, "reveal_steps", None)
+            if gen_reveal_steps:
+                for idx, step in enumerate(gen_reveal_steps):
+                    position = sequence_length + idx
+                    if position < total_length:
+                        full_reveal_steps[position] = step
+            reveal_steps_list.append(full_reveal_steps)
+
             response_length = sequence_length + len(generated_tokens)
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
@@ -806,11 +863,13 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         # Create return data conforming to GenerationOutputSpec
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
+        reveal_steps = torch.stack(reveal_steps_list)
 
         return_data = BatchedDataDict[GenerationOutputSpec](
             {
                 "output_ids": output_ids,
                 "logprobs": logprobs,
+                "reveal_steps": reveal_steps,
                 "generation_lengths": torch.tensor(
                     generation_lengths, dtype=torch.long
                 ),

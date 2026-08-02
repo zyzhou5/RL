@@ -1,0 +1,27 @@
+# TraceGRPO on DeepScaleR, random t0.6 k2 fullblocks + icepop [0.8,1.2]
+#   + SHARED POSITION ORDER (common random numbers): every rollout of a prompt
+#     group carries the same prompt-hash dllm_position_seed, so FastDiffuser's
+#     random selection reveals positions in the same per-block priority order
+#     across the group. Reveal-order luck becomes a shared constant inside each
+#     group and cancels exactly in the group-relative advantage baseline; the
+#     per-rollout marginal decode distribution is unchanged (fixed-permutation
+#     reveal == uniform sampling without replacement).
+#
+# ONLY delta vs the parent (ds_trace_fb_kl001_nonorm_icepop0812 arm): the
+# shared_position_seed client flag. A/B against the parent measures how much
+# of the random arm's slow learning is order-luck advantage noise.
+# Requires sglang fork >= 91acf0041 (custom_params ungating + CRN priority).
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron_fullblocks_kl001_nonorm_icepop0812.yaml"
+
+policy:
+  generation:
+    sglang_cfg:
+      shared_position_seed: true
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-random-t06-deepscaler-fullblocks-kl001-nonorm-icepop0812-sharedseed-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-random-t06-deepscaler-fullblocks-kl001-nonorm-icepop0812-sharedseed-sglang"
+  wandb:
+    name: "trace_deepscaler_fb_kl001_nonorm_icepop0812_sharedseed"

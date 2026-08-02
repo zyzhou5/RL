@@ -1,0 +1,29 @@
+# TraceGRPO 6x6, random t0.6 k2, emit_full_blocks, kl001 nonorm
+#   + icepop token-level importance-sampling filter on bounds [0.8, 1.2].
+#
+# Filters (zeros from the loss) tokens whose SGLang/Megatron ratio
+#   exp(prev_logprob - generation_logprob)
+# falls outside [0.8, 1.2]  (~ prev-gen outside (-0.223, +0.182) nats) -- i.e. tokens where the
+# training policy (prev) disagrees with the rollout-generation policy (gen). These are exactly
+# the trace-estimator mis-scores (dominated by gen>>prev, caught by the MIN bound 0.8) that
+# corrupt the gradient and drive the collapse.
+#
+# icepop zeros the IS weight of out-of-band tokens (dropped) and keeps the raw BOUNDED IS weight
+# (within [0.8,1.2]) on in-band survivors, so use_importance_sampling_correction MUST be true
+# (the loss asserts it). Log-based drop rate: ~0.7-1.1% healthy, ~5.7-9.3% during divergence;
+# the min bound does most of the work.
+defaults: "grpo_sudoku6x6_trace_grpo_random_t06_fullblocks_kl001_nonorm.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "icepop"
+  truncated_importance_sampling_ratio: 1.2        # max bound: drops prev >> gen
+  truncated_importance_sampling_ratio_min: 0.8    # min bound: drops gen >> prev
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-t06-sud6x6-fullblocks-kl001-nonorm-icepop0812-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-t06-sud6x6-fullblocks-kl001-nonorm-icepop0812-sglang"
+  wandb:
+    name: "trace_sud6x6_fb_kl001_nonorm_icepop0812"

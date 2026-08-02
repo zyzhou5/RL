@@ -32,6 +32,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     ReinforcePlusPlusAdvantageEstimator,
 )
 from nemo_rl.algorithms.coupled_grpo_logprobs import maybe_set_coupled_grpo_seed
+from nemo_rl.algorithms.trace_grpo_logprobs import maybe_set_trace_level_seed
 from nemo_rl.algorithms.loss import (
     ClippedPGLossConfig,
     ClippedPGLossDataDict,
@@ -1769,6 +1770,10 @@ def grpo_train(
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
+                            if "reveal_steps" not in message:
+                                message["reveal_steps"] = torch.zeros_like(
+                                    message["token_ids"], dtype=torch.long
+                                )
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -1786,6 +1791,7 @@ def grpo_train(
                             "input_ids": flat_messages["token_ids"],
                             "input_lengths": input_lengths,
                             "generation_logprobs": flat_messages["generation_logprobs"],
+                            "reveal_steps": flat_messages["reveal_steps"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
@@ -1813,18 +1819,33 @@ def grpo_train(
                     maybe_set_coupled_grpo_seed(
                         train_data, master_config["policy"], total_steps
                     )
+                    # TraceGRPO stochastic level sampling: same shared-seed
+                    # contract (no-op unless num_level_samples is set).
+                    maybe_set_trace_level_seed(
+                        train_data, master_config["policy"], total_steps
+                    )
                     logprob_data = BatchedDataDict[ClippedPGLossDataDict](
                         {
                             "input_ids": train_data["input_ids"],
                             "input_lengths": train_data["input_lengths"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
+                            # Needed by the trajectory-reveal (Trace) estimator to
+                            # replay each token's inference reveal step; ignored by
+                            # all other logprob estimators.
+                            "reveal_steps": train_data["reveal_steps"],
                             **extra_multimodal_data,
                         }
                     )
                     if "coupled_grpo_seed" in train_data:
                         logprob_data["coupled_grpo_seed"] = train_data[
                             "coupled_grpo_seed"
+                        ]
+                    # Trace stochastic level sampling: prev/ref logprobs must draw
+                    # the same per-row levels as the training pass.
+                    if "trace_level_sample_seed" in train_data:
+                        logprob_data["trace_level_sample_seed"] = train_data[
+                            "trace_level_sample_seed"
                         ]
                     prev_logprobs_out = policy.get_logprobs(
                         logprob_data, timer=timer
@@ -2172,6 +2193,10 @@ def grpo_train(
                     "generation_logprobs"
                 ].tolist()
                 log_data["prev_logprobs"] = train_data["prev_logprobs"].tolist()
+                # TraceGRPO: per-token commit steps, so dumped samples carry the
+                # full reveal trajectory (present only for the trace estimator).
+                if "reveal_steps" in train_data:
+                    log_data["reveal_steps"] = train_data["reveal_steps"].tolist()
                 # CoupledGRPO gen-kl verification: logprobs recomputed under
                 # SGLang's final_step mask (present only when
                 # verify_gen_kl_with_sglang_mask is enabled).
@@ -2921,6 +2946,14 @@ def async_grpo_train(
                                 message["generation_logprobs"] = torch.zeros_like(
                                     message["token_ids"], dtype=torch.float32
                                 )
+                            # Mirror the sync path: TraceGRPO needs per-token
+                            # inference reveal steps, and its estimator raises if
+                            # the key is missing. Zero-fill non-diffusion turns so
+                            # every message carries it.
+                            if "reveal_steps" not in message:
+                                message["reveal_steps"] = torch.zeros_like(
+                                    message["token_ids"], dtype=torch.long
+                                )
 
                     # Convert to flat format for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -2938,6 +2971,7 @@ def async_grpo_train(
                             "input_ids": flat_messages["token_ids"],
                             "input_lengths": input_lengths,
                             "generation_logprobs": flat_messages["generation_logprobs"],
+                            "reveal_steps": flat_messages["reveal_steps"],
                             "token_mask": flat_messages["token_loss_mask"],
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
@@ -2947,6 +2981,9 @@ def async_grpo_train(
                     # CoupledGRPO: async feeds train_data directly to prev/ref
                     # logprobs and training, so seed it once here (see sync path).
                     maybe_set_coupled_grpo_seed(
+                        train_data, master_config["policy"], step
+                    )
+                    maybe_set_trace_level_seed(
                         train_data, master_config["policy"], step
                     )
 

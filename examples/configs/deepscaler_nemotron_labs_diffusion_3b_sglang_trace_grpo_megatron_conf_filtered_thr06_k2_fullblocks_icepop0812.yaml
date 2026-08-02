@@ -1,0 +1,19 @@
+# TraceGRPO on DeepScaleR: confidence-filtered k=2 (thr 0.6) + emit_full_blocks.
+# Only delta vs the cf4 arm (conf_filtered_thr06_k2_noseed): the dllm yaml swaps
+# to the fullblocks variant, so this vs cf4 isolates replay exactness for the
+# filtered decode. Inherits seq-level loss (token_level_loss false), no shared
+# seed, icepop [0.8,1.2], kl001-k3 from the parent chain.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron_conf_filtered_thr06_k2_noseed_icepop0812.yaml"
+
+policy:
+  generation:
+    sglang_cfg:
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_conf_filtered_thr06_k2_fullblocks.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-conf-filtered-thr06-k2-fullblocks-deepscaler-icepop0812-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-conf-filtered-thr06-k2-fullblocks-deepscaler-icepop0812-sglang"
+  wandb:
+    name: "trace_deepscaler_conf_filtered_thr06_k2_fullblocks_icepop0812"

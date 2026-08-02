@@ -348,6 +348,13 @@ class DiffusionMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl, ABC):
             current_device_uuid=self.report_device_id(),
         )
 
+    def _valid_toks_correction(self, batch):
+        """Tokens counted in token_mask but excluded from the loss, subtracted
+        from global_valid_toks at the normalizer seam. Zero by default;
+        overridden per-algo (TraceGRPO removes the emit_full_blocks post-EOS
+        tail so the loss normalizer matches the loss coverage)."""
+        return 0
+
     def _coupled_pair_count_scale(self) -> int:
         """Multiplier on the global valid seq/token counts used to normalize the loss.
 
@@ -429,6 +436,12 @@ class DiffusionMegatronPolicyWorkerImpl(MegatronPolicyWorkerImpl, ABC):
                 )
                 global_valid_seqs = gb_result["global_valid_seqs"]
                 global_valid_toks = gb_result["global_valid_toks"]
+                # Subtract algo-specific tokens that are counted in token_mask but
+                # excluded from the loss (0 by default; TraceGRPO removes the
+                # emit_full_blocks post-EOS tail so the normalizer matches the loss).
+                global_valid_toks = global_valid_toks - self._valid_toks_correction(
+                    gb_result["batch"]
+                )
                 # Scale the loss normalizer when the training schedule accumulates each
                 # token / sequence more than once per step (CoupledGRPO with K>1 coupled
                 # pairs). Only the counts passed to forward/backward are scaled; the

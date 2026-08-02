@@ -1,0 +1,18 @@
+# FastDiffuser confidence decoding for the inference-trajectory-replay ("Trace")
+# GRPO baseline. Identical decoding to diffugrpo_fastdiffuser.yaml
+# (confidence, threshold 0.9, block_size 32, max_steps 32) but with
+# logprob_mode: trajectory (keeps the per-token reveal-step logprobs, no SPG
+# sentinel) plus return_reveal_steps: true, which is the explicit opt-in that
+# makes FastDiffuser emit each token's block-relative commit_step as
+# meta_info["output_token_reveal_steps"]. block_size and max_steps here MUST match
+# policy.logprob_estimation.{block_size,max_steps} so the recorded commit steps
+# line up with the training reveal-level layout.
+algorithm: FastDiffuser
+block_size: 32
+max_steps: 32
+causal_context: true
+temperature: 1.0
+threshold: 0.9
+selection_policy: confidence
+logprob_mode: trajectory
+return_reveal_steps: true

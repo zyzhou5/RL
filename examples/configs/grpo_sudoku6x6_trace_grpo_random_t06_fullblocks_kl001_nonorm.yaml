@@ -1,0 +1,34 @@
+# TraceGRPO 6x6, random t0.6 k2, emit_full_blocks -- mitigation arm:
+#  * loss_fn.reference_policy_kl_penalty 0.01 (k3): the anchor that partially
+#    rescued the earlier collapse (nonzero gradient at zero reward).
+#  * grpo.normalize_rewards false: advantage = reward - group mean WITHOUT the
+#    group-std division. The std normalization is what turned a half-wrong grid
+#    (reward 0.571) into a +3.23 advantage in a homogeneous group -- the
+#    "relative junk amplification" ratchet seen in the full-trace forensics.
+defaults: "grpo_sudoku6x6_trace_grpo_random_t06_fullblocks.yaml"
+
+grpo:
+  normalize_rewards: false
+  skip_reference_policy_logprobs_calculation: false
+
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  reference_policy_kl_type: "k3"
+
+policy:
+  generation:
+    # Feeds TrainingSamplingParams: forward_with_post_processing_fn (train.py)
+    # centrally tempers the logits for every Loss/Logprobs post-processor, so
+    # Megatron prev/curr/ref logprobs are computed at the SAME temperature the
+    # FastDiffuser rollouts were sampled with (on-policy-consistent training).
+    # Must match the dllm yaml temperature. Do NOT scale again in
+    # diffu_grpo_train.py -- that double-tempers (effective T = t^2).
+    temperature: 0.6
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-random-t06-sudoku6x6-fullblocks-kl001-nonorm-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-random-t06-sudoku6x6-fullblocks-kl001-nonorm-sglang"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-random-t06-sudoku6x6-fullblocks-kl001-nonorm-blanks-fewshot"
