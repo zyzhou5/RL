@@ -1,0 +1,46 @@
+# TraceGRPO, 6x6 Sudoku, vLLM sync generation: random reveal @ T=0.6, k=2,
+# full-block emission, KL 0.01 (k3), no reward normalization, with TIS
+# (clamp-to-max) instead of icepop (zero-outside-band).
+#
+# Child of the icepop config; ONLY the truncation mode changes.
+#
+# Why tis rather than icepop:
+#   * icepop ZEROES tokens whose IS weight falls outside [0.8, 1.2]. A zeroed
+#     token loses its policy gradient but KEEPS its full KL-to-reference term,
+#     because loss = actor_loss + kl and kl is never IS-weighted. Those tokens
+#     are then pulled toward the reference with no reward signal opposing it.
+#   * tis instead clamps only the upper tail, so every token keeps a gradient.
+#   * icepop's two-sided band was designed for MoE router flips, where a
+#     discrepancy in EITHER direction means the measurement is untrustworthy.
+#     Under one-step-stale async data the low weights are not corruption --
+#     they are the correct, genuinely smaller likelihood under the updated
+#     policy -- so deleting them discards real signal.
+#
+# Bound chosen from the measured weight distribution at step 100 of the
+# icepop runs (w = exp(prev_logprobs - generation_logprobs), masked tokens):
+#   sync : p90 1.000  p99 1.096  max 1.79  -> frac(w>2.0) = 0.000%
+#   async: p90 1.012  p99 1.441  max 9.22  -> frac(w>2.0) = 0.300%
+# 2.0 clamps the genuine variance outliers while leaving the legitimate
+# distribution untouched. For THIS sync run it is a no-op, which makes the run
+# a control: if it still converges to ~0.89 reward, icepop's filtering was
+# never load-bearing on the sync path.
+#
+# truncated_importance_sampling_ratio_min is nulled because tis never reads it
+# (only icepop / seq-mask-tis use a lower bound); leaving 0.8 would imply a
+# lower bound that is not applied.
+defaults: "grpo_sudoku6x6_trace_grpo_vllm_random_t06_k2_fullblocks_icepop0812.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: null
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-t06-sud6x6-fb-kl001-nonorm-tis20-vllm"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-t06-sud6x6-fb-kl001-nonorm-tis20-vllm"
+  wandb:
+    name: "trace_sud6x6_fb_kl001_nonorm_tis20_vllm"

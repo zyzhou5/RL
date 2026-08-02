@@ -1,0 +1,27 @@
+# TraceGRPO DeepScaleR Megatron toy smoke config.
+# Runs only 8 prompts x 8 generations per prompt (64 samples) on a SINGLE node
+# for a fast, cheap code smoke. Inherits the TraceGRPO config, shrinks the grpo
+# batch, and overrides the production cluster.num_nodes: 16 -> 1 (the base
+# megatron parallelism fits 8 GPUs, as the gsm8k *_toy_p8_g8 configs show).
+# Requires the SGLang fork's logprob_mode: trajectory + return_reveal_steps.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron.yaml"
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+
+policy:
+  train_global_batch_size: 64
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-megatron-toy-8p8g"
+
+logger:
+  log_dir: "logs/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-megatron-sglang-toy-8p8g"
+  wandb:
+    name: "grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-megatron-sglang-toy-8p8g"

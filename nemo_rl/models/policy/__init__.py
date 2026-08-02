@@ -445,12 +445,55 @@ class ESPOBlockAwareLogprobEstimationConfig(TypedDict):
     exclude_mask_token_from_logits: NotRequired[bool]
 
 
+class TraceGRPOLogprobEstimationConfig(TypedDict):
+    """Estimate response logprobs by replaying the inference denoising trajectory.
+
+    TraceGRPO reuses DiffuGRPO's asymmetric ``[noisy | clean]`` layout and the
+    block-reveal per-level machinery, but the reveal order is taken from the actual
+    SGLang FastDiffuser confidence-decoding trajectory: each token's block-relative
+    ``commit_step`` (recorded during rollout via ``logprob_mode: trajectory`` +
+    ``return_reveal_steps: true``) is dense-ranked per sample into a reveal level.
+    At level ``L`` tokens committed before ``L`` are revealed as real context and
+    tokens committed at ``L`` are harvested. The number of levels is data-dependent
+    and agreed across data-parallel ranks with a single ``all_reduce(MAX)`` (clamped
+    by ``max_reveal_levels``) so every rank runs the same number of forwards.
+    ``block_size`` must match the model's block-diffusion layout (it sets the semi-AR
+    attention windows); the reveal levels come from the recorded commit steps
+    directly, so no ``max_steps`` is needed here (it is a rollout-only FastDiffuser
+    setting).
+    """
+
+    type: Literal["trace_grpo"]
+    mask_token_id: int
+    # If omitted, the model module's ``config.block_size`` is used.
+    block_size: NotRequired[int]
+    # Cap on data-dependent reveal-level passes.
+    max_reveal_levels: NotRequired[int]
+    # Stochastic level sampling: draw this many trajectory levels per sample per
+    # step (without replacement) instead of running every level -- cost drops
+    # from the batch-max trajectory depth to k forwards per pass. The loss mask
+    # carries the depth/k inverse-inclusion weight and prev/train passes share
+    # the draws via maybe_set_trace_level_seed. Omit for the exhaustive
+    # (exact, every-level) schedule.
+    num_level_samples: NotRequired[int]
+    # Base seed for the per-(row, step) level draws (default 0).
+    seed_base: NotRequired[int]
+    # Mainline noisy-tail knob (diffu_grpo_logprobs): what the block-pad
+    # positions between the response end and its block boundary hold during
+    # replay -- "mask" (EOS-commit-time context; default), "eos"
+    # (post-propagation context), or "none" (no block padding).
+    noisy_tail_mode: NotRequired[str]
+    # Drop the MASK token from the scored logits (matches DiffuGRPO default).
+    exclude_mask_token_from_logits: NotRequired[bool]
+
+
 LogprobEstimationConfig = Union[
     JustGRPOLeftmostRevealLogprobEstimationConfig,
     DiffuGRPOLogprobEstimationConfig,
     BlockJustGRPOLogprobEstimationConfig,
     CoupledGRPOLogprobEstimationConfig,
     ESPOBlockAwareLogprobEstimationConfig,
+    TraceGRPOLogprobEstimationConfig,
 ]
 
 

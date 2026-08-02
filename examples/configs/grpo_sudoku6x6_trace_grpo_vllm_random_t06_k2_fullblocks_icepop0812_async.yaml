@@ -1,0 +1,37 @@
+# TraceGRPO, 6x6 Sudoku, vLLM ASYNC engine: random reveal @ T=0.6, k=2,
+# full-block emission, KL 0.01 (k3), no reward normalization, icepop TIS.
+#
+# Child of the sync icepop config; the ONLY change is
+# vllm_cfg.async_engine: true, which swaps VllmGenerationWorker for
+# VllmAsyncGenerationWorker (AsyncLLM front-end instead of the synchronous
+# LLM engine). Trainer side, decode policy, importance sampling, and the
+# reveal-step channel are all inherited unchanged.
+#
+# The reveal-step channel is wired in BOTH workers: vllm_worker_async.py
+# fills GenerationOutputs["reveal_steps"] with the same zeros-for-input /
+# step-for-generated layout as the sync worker and the SGLang worker, so the
+# trace estimator consumes it identically.
+#
+# NOTE: this is the async ENGINE inside ordinary synchronous GRPO steps
+# (generate -> train -> generate). It is NOT full async-GRPO trajectory
+# collection, which additionally needs grpo.async_grpo.enabled,
+# max_trajectory_age_steps, and non-colocated inference.
+#
+# The diffusion backend has only ever been validated end-to-end with the sync
+# engine, so a failure here may be an async/dLLM interaction rather than
+# anything to do with the reveal-step or importance-sampling paths.
+defaults: "grpo_sudoku6x6_trace_grpo_vllm_random_t06_k2_fullblocks_icepop0812.yaml"
+
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-t06-sud6x6-fb-kl001-nonorm-icepop0812-vllm-async"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-t06-sud6x6-fb-kl001-nonorm-icepop0812-vllm-async"
+  wandb:
+    name: "trace_sud6x6_fb_kl001_nonorm_icepop0812_vllm_async"

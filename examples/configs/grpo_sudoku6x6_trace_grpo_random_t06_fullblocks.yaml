@@ -1,0 +1,23 @@
+# TraceGRPO 6x6 Sudoku, random t0.6 k2, with emit_full_blocks generation: the
+# sanity check that removes the EOS trim-loss entirely (responses are block
+# multiples; every committed token comes back with its reveal step; the trace
+# replay conditions the EOS exactly as the decoder did). Post-first-EOS tokens
+# are context-only in training (score/loss zeroed in build_trace_base).
+# Watch: (a) EOS parity ~0 in analyze_trace_eos_parity.py, (b) whether the
+# collapse dynamics change vs the trimmed run (peak 0.246@20, dead@34), and
+# (c) that env rewards still parse (trailing tail tokens now reach the env text).
+defaults: "grpo_sudoku6x6_trace_grpo_random_t06.yaml"
+
+policy:
+  generation:
+    sglang_cfg:
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_random_t06_k2_fullblocks.yaml"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-random-t06-sudoku6x6-fullblocks-megatron"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-random-t06-sudoku6x6-fullblocks-sglang"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-random-t06-sudoku6x6-fullblocks-blanks-fewshot"

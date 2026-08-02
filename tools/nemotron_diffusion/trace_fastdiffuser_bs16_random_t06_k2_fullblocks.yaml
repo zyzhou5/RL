@@ -1,0 +1,18 @@
+# Same as trace_fastdiffuser_bs16_random_t06_k2.yaml (random unmasking, t0.6,
+# 2 tok/step on full 16-blocks) plus emit_full_blocks: responses are NOT trimmed
+# at the first positional EOS -- the whole final block is returned (post-EOS
+# commits + propagated EOS), with logprobs/reveal steps for every token. This
+# makes the response a block_size multiple, so the trace replay sees the exact
+# decode-time context for the EOS block (the -0.4 nat EOS bias mechanism is
+# structurally removed; see analyze_trace_eos_parity.py). The trace estimator
+# treats post-first-EOS tokens as context-only (no loss/score).
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 8
+causal_context: true
+temperature: 0.6
+threshold: null
+selection_policy: random
+logprob_mode: trajectory
+return_reveal_steps: true
+emit_full_blocks: true

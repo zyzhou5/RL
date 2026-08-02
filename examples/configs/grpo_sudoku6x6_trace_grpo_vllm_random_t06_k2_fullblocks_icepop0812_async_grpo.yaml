@@ -1,0 +1,59 @@
+# TraceGRPO, 6x6 Sudoku, vLLM with FULL ASYNC-GRPO: overlapped rollout
+# collection (trajectory staleness <= 1 step) on top of random reveal @ T=0.6,
+# k=2, full-block emission, KL 0.01 (k3), no reward normalization, icepop TIS.
+#
+# Child of the async-ENGINE icepop config. That config only swapped in
+# AsyncLLM inside ordinary synchronous GRPO steps (generate -> train ->
+# generate), which measured ~2.3s/step SLOWER than sync because there is no
+# concurrent work for it to overlap with. This config adds the three things
+# async_grpo_train actually requires (nemo_rl/algorithms/grpo.py:2546):
+#
+#   1. grpo.async_grpo.enabled + max_trajectory_age_steps
+#   2. loss_fn.use_importance_sampling_correction: true  -- already on via
+#      the icepop parent; async GRPO asserts it, because trajectories are
+#      off-policy by up to max_trajectory_age_steps weight versions.
+#   3. NON-colocated inference: generation gets its own node so rollouts can
+#      run WHILE training runs. Colocated would serialize them on the same
+#      GPUs and defeat the point.
+#
+# Node math: cluster.num_nodes counts train + generation. With 1 generation
+# node, 9 total leaves 8 training nodes -> DP = 8*8 = 64, which divides
+# train_global_batch_size 1024 exactly (16 per rank) and matches the training
+# width of the colocated sync/async runs, so the comparison stays clean.
+# 8 total would leave 7 training nodes -> DP 56, and 1024/56 is not an
+# integer.
+#
+# max_trajectory_age_steps: 1 -- trajectories may be at most one weight
+# version old, so in-flight weight updates are not needed (grpo.py warns only
+# when age > 1 without them).
+#
+# NOTE: first run under a fresh ENV_TAG builds the AsyncTrajectoryCollector
+# and ReplayBuffer worker venvs (they run on the STOCK uv vLLM env, not the
+# NRL_VLLM_PY_EXECUTABLE runtime, since the collector needs the full nemo_rl
+# import closure and never runs an engine). Budget extra wall time for that.
+defaults: "grpo_sudoku6x6_trace_grpo_vllm_random_t06_k2_fullblocks_icepop0812_async.yaml"
+
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+
+policy:
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+
+cluster:
+  num_nodes: 9   # 8 training + 1 generation
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-t06-sud6x6-fb-icepop0812-vllm-async-grpo"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-t06-sud6x6-fb-icepop0812-vllm-async-grpo"
+  wandb:
+    name: "trace_sud6x6_fb_icepop0812_vllm_async_grpo"

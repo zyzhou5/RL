@@ -1,0 +1,15 @@
+# FastDiffuser confidence decoding for TraceGRPO at block_size=16.
+# Same trajectory recording as trace_fastdiffuser.yaml (logprob_mode: trajectory
+# keeps per-token reveal-step logprobs; return_reveal_steps: true emits each
+# token's block-relative commit_step as meta_info["output_token_reveal_steps"]),
+# but with 16-token generation blocks. block_size/max_steps kept in sync with the
+# policy model block_size (policy.hf_config_overrides.block_size: 16).
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 16
+causal_context: true
+temperature: 1.0
+threshold: 0.9
+selection_policy: confidence
+logprob_mode: trajectory
+return_reveal_steps: true

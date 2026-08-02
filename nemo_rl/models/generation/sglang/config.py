@@ -102,6 +102,11 @@ class SglangSpecificArgs(TypedDict):
     # is a path to the SGLang YAML file that configures the algorithm.
     dllm_algorithm: NotRequired[str | None]
     dllm_algorithm_config: NotRequired[str | None]
+    # Shared position-order (CRN) for dLLM decoding: attach a prompt-hash
+    # "dllm_position_seed" to every request so all GRPO rollouts of a prompt
+    # group reveal positions in the same order (FastDiffuser
+    # selection_policy=random). Client-side flag; not forwarded to ServerArgs.
+    shared_position_seed: NotRequired[bool]
 
 
 class SGLangConfig(GenerationConfig):

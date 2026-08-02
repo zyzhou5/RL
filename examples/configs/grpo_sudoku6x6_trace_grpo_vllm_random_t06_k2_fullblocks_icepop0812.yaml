@@ -1,0 +1,43 @@
+# TraceGRPO on Nemotron-Labs-Diffusion-3B, 6x6 Sudoku, vLLM generation:
+# random reveal order @ T=0.6, k=2, full-block emission, KL 0.01 (k3), no
+# reward normalization, PLUS icepop truncated importance sampling.
+#
+# vLLM counterpart of
+# grpo_sudoku6x6_trace_grpo_random_t06_fullblocks_kl001_nonorm_icepop0812.yaml
+# ("trace_sud6x6_fb_kl001_nonorm_icepop0812"). The loss_fn block below is
+# copied verbatim from it; everything else is inherited from the vLLM random
+# config, which ALREADY carries the rest of that SGLang chain:
+#   grpo.normalize_rewards: false                       (trace parent)
+#   grpo.skip_reference_policy_logprobs_calculation: false
+#   loss_fn.reference_policy_kl_penalty: 0.01, kl_type k3
+#   policy.generation.temperature: 0.6
+# so only the importance-sampling knobs are new here.
+#
+# WHY: the vLLM random-t06 run without importance sampling
+# (trace_sud6_vllm_rand_t06_k2_fullblocks, job 14455641) reproduced the known
+# TraceGRPO collapse -- reward climbed 0.10 -> 0.70 by ~step 120, then fell to
+# ~0.005 by ~step 280 while the generation-KL error grew from 1.1e-3 to 2.8e-1.
+# icepop zeroes the tokens whose importance weight falls outside [0.8, 1.2],
+# which is the mechanism that keeps a handful of badly-scored tokens per batch
+# from dominating the exp-sensitive ratio and driving that collapse.
+#
+# NOTE: this config does NOT inherit the SGLang icepop file directly. Doing so
+# would drag in that chain's generation section (backend sglang + sglang_cfg)
+# and fight the vLLM one on merge; copying the four loss_fn keys keeps a single
+# unambiguous generation section.
+defaults: "grpo_sudoku6x6_trace_grpo_vllm_random_t06_k2_fullblocks.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "icepop"
+  truncated_importance_sampling_ratio: 1.2        # max bound: drops prev >> gen
+  truncated_importance_sampling_ratio_min: 0.8    # min bound: drops gen >> prev
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-t06-sud6x6-fb-kl001-nonorm-icepop0812-vllm"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-t06-sud6x6-fb-kl001-nonorm-icepop0812-vllm"
+  wandb:
+    name: "trace_sud6x6_fb_kl001_nonorm_icepop0812_vllm"

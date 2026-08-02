@@ -1,0 +1,43 @@
+# TraceGRPO on Nemotron-Labs-Diffusion-3B, 6x6 Sudoku (2x3 boxes), vLLM
+# generation with the ASYNC engine.
+#
+# Identical to grpo_sudoku6x6_trace_grpo_vllm.yaml except
+# vllm_cfg.async_engine: true, which swaps VllmGenerationWorker for
+# VllmAsyncGenerationWorker (AsyncLLM front-end instead of the synchronous
+# LLM engine). Everything else -- trainer side, decode policy, and the
+# reveal-step channel -- is inherited unchanged.
+#
+# The reveal-step channel is wired in BOTH workers: vllm_worker_async.py
+# fills GenerationOutputs["reveal_steps"] with the same zeros-for-input /
+# step-for-generated layout as the sync worker and the SGLang worker, so the
+# trace estimator consumes it identically.
+#
+# NOTE: this is only the async ENGINE within ordinary synchronous GRPO steps
+# (generate -> train -> generate). It is NOT full async-GRPO trajectory
+# collection; that path additionally needs grpo.async_grpo.enabled,
+# loss_fn.use_importance_sampling_correction, and non-colocated inference
+# (see grpo_sudoku6x6_block_just_grpo_vllm_async_grpo.yaml in the RL-vllm
+# worktree for that shape).
+#
+# The diffusion backend has only ever been validated end-to-end with the sync
+# engine, so this config is partly a test of whether the async path works
+# with the dLLM/spec-decode machinery at all -- a failure here is not
+# necessarily a reveal-step problem.
+#
+# Requires the custom vLLM runtime built from the fork branch carrying
+# DiffusionConfig.return_reveal_steps:
+#   NRL_VLLM_PY_EXECUTABLE=<vllm-runtime-venv>/bin/python-compat
+defaults: "grpo_sudoku6x6_trace_grpo_vllm.yaml"
+
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-sudoku6x6-megatron-vllm-async"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-sudoku6x6-vllm-async"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-sudoku6x6-megatron-vllm-async"

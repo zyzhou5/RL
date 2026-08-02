@@ -807,6 +807,13 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     dtype=torch.float32,
                     device=input_ids_single_row.device,
                 )
+                # Keep the reveal-step key present (and zero) so the key set is
+                # identical across every branch and both backends.
+                reveal_steps_single_item = torch.zeros(
+                    (1, current_input_actual_length),
+                    dtype=torch.long,
+                    device=input_ids_single_row.device,
+                )
 
                 generation_lengths_tensor = torch.tensor(
                     [0], dtype=torch.long, device=input_ids_single_row.device
@@ -827,6 +834,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                     {
                         "output_ids": output_ids_single_item_batched,
                         "logprobs": logprobs_single_item,
+                        "reveal_steps": reveal_steps_single_item,
                         "generation_lengths": generation_lengths_tensor,
                         "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                         "truncated": truncated_tensor,
@@ -946,6 +954,21 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                                     0, position_in_output_tensor
                                 ] = entropy_value
 
+            # Diffusion reveal-step channel (return_reveal_steps): zeros for
+            # input positions, the block-relative denoising step for each
+            # generated token. Matches the SGLang worker's layout.
+            reveal_steps_single_item = torch.zeros(
+                (1, final_output_tensor_len),
+                dtype=torch.long,
+                device=original_input_ids_single_row.device,
+            )
+            gen_reveal_steps = getattr(generation_details, "reveal_steps", None)
+            if gen_reveal_steps:
+                for idx, step in enumerate(gen_reveal_steps):
+                    position_in_output_tensor = current_input_actual_length + idx
+                    if position_in_output_tensor < final_output_tensor_len:
+                        reveal_steps_single_item[0, position_in_output_tensor] = step
+
             # Generation lengths
             generation_lengths_tensor = torch.tensor(
                 [num_generated_tokens],
@@ -973,6 +996,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 {
                     "output_ids": output_ids_single_item_batched,
                     "logprobs": logprobs_single_item,
+                    "reveal_steps": reveal_steps_single_item,
                     "generation_lengths": generation_lengths_tensor,
                     "unpadded_sequence_lengths": unpadded_sequence_lengths_tensor,
                     "truncated": truncated_tensor,

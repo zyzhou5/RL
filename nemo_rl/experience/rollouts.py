@@ -114,6 +114,11 @@ def generate_responses(
                 i, input_length:total_length
             ]
 
+        if "reveal_steps" in generation_outputs:
+            assistant_message["reveal_steps"] = generation_outputs["reveal_steps"][
+                i, input_length:total_length
+            ]
+
         batch["message_log"][i].append(assistant_message)
 
     # Generation metrics
@@ -217,6 +222,11 @@ async def generate_responses_async(
             ]
         if "entropy" in generation_outputs:
             assistant_message["generation_entropy"] = generation_outputs["entropy"][
+                i, input_length:total_length
+            ]
+
+        if "reveal_steps" in generation_outputs:
+            assistant_message["reveal_steps"] = generation_outputs["reveal_steps"][
                 i, input_length:total_length
             ]
 

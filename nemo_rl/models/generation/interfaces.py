@@ -218,6 +218,12 @@ class GenerationOutputSpec(TypedDict):
     # enabled (FastDiffuser return_entropy); consumed by the JustGRPO-Fast
     # block-reveal estimator. Absent otherwise.
     entropy: NotRequired[torch.Tensor]
+    reveal_steps: NotRequired[
+        torch.Tensor
+    ]  # Per-token block-relative denoising step that committed each token (Trace
+    #    JustGRPO). Backend-agnostic: SGLang emits it via FastDiffuser
+    #    logprob_mode="trajectory" + return_reveal_steps, vLLM via
+    #    diffusion_config.return_reveal_steps. Zero-filled when neither is enabled.
     truncated: NotRequired[
         torch.Tensor
     ]  # Whether each sequence was truncated and hit max_tokens without stop token
