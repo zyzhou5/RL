@@ -46,6 +46,102 @@ After submission, explicitly share the exact submission command with the user to
 
 Use PARTITION=batch for all sbatch submissions. The dfw batch partition has a 4-hour limit, so keep TIME at or below 04:00:00. Adjust NODES as needed, but do not submit these experiments to backfill, batch_long, batch_large, or batch_large_long.
 
+## vLLM Diffusion Backend (async-GRPO + NeMo-Gym)
+
+The default backend above is SGLang. There is a second, separate path that runs
+the dLLM over a **custom vLLM fork** with non-colocated async-GRPO and NeMo-Gym
+data routing -- this is what the v30 deterministic-agent runs use.
+
+Configs live under `examples/configs/*_vllm_*` (and
+`examples/configs/grpo_sudoku6x6_*_vllm*` for the sudoku smokes). The production
+v30 config is:
+
+- main: `CONFIG=examples/configs/nemotron_labs_diffusion_8b_vllm_block_just_grpo_async_grpo_nemogym_v30.yaml`
+- toy:  `CONFIG=examples/configs/nemotron_labs_diffusion_8b_vllm_block_just_grpo_async_grpo_nemogym_v30_toy.yaml`
+
+The v30 config bakes in its own overrides (8B checkpoint, node split, grpo
+sizes, `enforce_eager`, `sequence_parallel`, etc.); read its header comment for
+the current values rather than re-passing them on the command line.
+
+### What differs from an SGLang submit
+
+- **Entry script**: `RUN_SCRIPT=examples/nemo_gym/run_grpo_nemo_gym.py` (not the
+  default `examples/run_grpo.py`).
+- **uv extras**: `UV_EXTRAS="mcore nemo_gym"` (adds the `nemo_gym`
+  optional-dependency group on top of `mcore`).
+- **NeMo-Gym server venv**: `NEMO_GYM_VENV_DIR=/lustre/fsw/portfolios/coreai/users/snorouzi/gym_venvs`
+  (pre-provisioned; the gym agent/server runs from it).
+- **vLLM runtime**: `NRL_VLLM_PY_EXECUTABLE=<vllm-runtime-venv>/bin/python-compat`
+  -- see below.
+- **ENV_TAG**: a vLLM/nemo_gym driver-env tag, distinct from the SGLang
+  `mb_3rdparty_sglagn_local_fork`, e.g. `mb_3rdparty_vllm_local_fork`. The
+  driver env must carry the `nemo_gym` extra; because `--no-sync` will not
+  add it, build this tag once with `NRL_FORCE_REBUILD_VENVS=true` before
+  normal reuse.
+
+### `NRL_VLLM_PY_EXECUTABLE`
+
+The vLLM generation workers run a **custom, pre-built vLLM fork** (the
+diffusion-capable engine), not the vLLM uv would install into the driver env.
+`NRL_VLLM_PY_EXECUTABLE` is the absolute path to that runtime's python, e.g.:
+
+```
+NRL_VLLM_PY_EXECUTABLE=/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_792ab07/bin/python-compat
+```
+
+When it is set, two things change (see `ray_actor_environment_registry.py` and
+`vllm_worker.py`):
+
+1. `VLLM_EXECUTABLE` becomes this path, so Ray launches the vLLM generation
+   actors directly on this python -- no per-actor uv venv is built for them. The
+   `AsyncTrajectoryCollector` / `ReplayBuffer` actors deliberately stay on the
+   stock `PY_EXECUTABLES.VLLM` uv env (they need the full nemo_rl import closure
+   and never run an engine).
+2. The vLLM source monkey-patches (`_patch_vllm_init_workers_ray`, eagle3,
+   hermes) are **skipped**, so the launcher does not rewrite the fork's source
+   tree. Apply any equivalent change in the fork deliberately if TP/PP>1 needs
+   it.
+
+Configs reference it via `py_executable: ${oc.env:NRL_VLLM_PY_EXECUTABLE,unknown}`,
+so if you forget to export it the run fails fast with an `unknown` executable
+rather than silently using the wrong python.
+
+### Diffusion temperature must match
+
+vLLM denoises the whole canvas per step under one engine-wide temperature, so a
+request's per-request temperature is only a gate (0 or 1). The worker asserts
+`policy.generation.temperature == policy.generation.vllm_kwargs.diffusion_config.temperature`
+and raises if they differ: rollout logprobs are recorded at the
+`diffusion_config` value while the Megatron recompute tempers by
+`generation.temperature`, so a mismatch silently desyncs train-vs-behavior and
+blows up gen-KL. Keep the two equal.
+
+### Example v30 toy smoke submit
+
+```bash
+RUN_NAME=grpo_nd8b_v30_smoke \
+WANDB_RUN_NAME=grpo_nd8b_v30_smoke \
+JOB_NAME=v30_smoke \
+ACCOUNT=coreai_dlalgo_genai \
+PARTITION=batch \
+TIME=00:40:00 \
+NODES=3 \
+ENV_TAG=mb_3rdparty_vllm_local_fork \
+RUN_SCRIPT=examples/nemo_gym/run_grpo_nemo_gym.py \
+UV_EXTRAS="mcore nemo_gym" \
+NEMO_GYM_VENV_DIR=/lustre/fsw/portfolios/coreai/users/snorouzi/gym_venvs \
+NRL_VLLM_PY_EXECUTABLE=/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_792ab07/bin/python-compat \
+CONFIG=examples/configs/nemotron_labs_diffusion_8b_vllm_block_just_grpo_async_grpo_nemogym_v30_toy.yaml \
+NRL_FORCE_REBUILD_VENVS=false \
+FORCE_REINSTALL_PACKAGES=false \
+FORCE_REINSTALL_SGLANG=false \
+bash tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --sbatch
+```
+
+The toy config is 3 nodes (2 train + 1 gen). For the full production run, swap
+to the non-toy `..._v30.yaml` config and set `NODES=15` -- it must match the
+config's baked-in `cluster.num_nodes: 15` node split (12 train + 3 gen).
+
 ## Account Selection (Fair Share)
 
 Pick `ACCOUNT` based on Slurm fair-share: submit under the eligible account with the **highest current FairShare**, since that account gets the best scheduling priority (shortest queue wait).
@@ -131,6 +227,36 @@ Use these deliberately:
 NeMo-RL is installed editable in the usual driver and Ray worker environments, so source-only edits to the active RL worktree do not require `NRL_FORCE_REBUILD_VENVS=true` or `FORCE_REINSTALL_NEMO_RL=true`. Rebuilding the venv can unnecessarily trigger slow dependency builds such as TransformerEngine.
 
 If `sglang` is an editable path dependency in `pyproject.toml`, normal Python edits in that SGLang checkout are picked up by new worker processes after restart. Dependency, metadata, kernel, or compiled-extension changes still require reinstall/rebuild.
+
+## Environment Sync: the launcher runs `uv run --no-sync`
+
+The wrapper runs the driver process, the Ray head, and every Ray worker with
+`uv run --no-sync` (the driver `uv run`, plus the exported `RAY_START_CMD` /
+`RAY_STATUS_CMD`). `--no-sync` tells uv to **use the project env on disk exactly
+as-is and never reconcile it to `uv.lock`**. This is baked into the launcher;
+you do not pass it yourself.
+
+Why it is required (not cosmetic): ray bringup runs `RAY_START_CMD` on the head
+and on every worker **concurrently**, all pointed at the same shared driver env
+under `UV_PROJECT_ENVIRONMENT` on lustre. Without `--no-sync` each of those is a
+`uv run --locked`, i.e. a destructive reconcile (uninstall + reinstall) of that
+one shared directory at the same moment. Concurrent reconciles corrupt the env
+("failed to create directory" / "Failed to read metadata"), which then surfaces
+as a Ray start race (`AttributeError: 'NoneType' object has no attribute
+'decode'`) and `check_srun_processes` tears the whole job down. `--no-sync`
+drops the reconcile entirely, so during bringup the shared env is only read,
+never mutated. (The main SGLang runs did not hit this only because their env
+happened to already be in sync; it bit the vLLM/nemo_gym env right after a
+`pyproject.toml` change forced a reconcile.)
+
+Operational consequence: because normal runs no longer sync the env, **a
+dependency change is not picked up automatically**. After editing
+`pyproject.toml` / `uv.lock` (new dependency, changed git pin, etc.) you must
+provision the env deliberately once -- run with `NRL_FORCE_REBUILD_VENVS=true`
+(and/or the relevant `FORCE_REINSTALL_*` flag), or bump `ENV_TAG` to build a
+fresh env -- before going back to normal `--no-sync` reuse. Source-only edits to
+editable trees (`nemo_rl/...`, an editable `sglang` or vLLM checkout) are
+unaffected and need no sync.
 
 ## Env Tag
 
