@@ -397,6 +397,25 @@ def _apply_parallelism_config(model_cfg: Any, config: PolicyConfig) -> None:
         "num_layers_in_last_pipeline_stage"
     ]
     model_cfg.sequence_parallel = config["megatron_cfg"]["sequence_parallel"]
+    # model_cfg is rebuilt from the converted checkpoint's run_config.yaml, which can
+    # carry scatter_embedding_sequence_parallel=false inherited from the Ministral3 VL
+    # provider (VL wrappers call language_model.embedding() themselves and scatter by
+    # hand after splicing image features in). The text-only diffusion model runs the
+    # plain GPTModel embedding path, so under SP the embedding MUST scatter -- otherwise
+    # linear_qkv all-gathers an unscattered sequence to tp_size * seq_len and the
+    # asymmetric semi-AR attention rejects it. Scoped to the diffusion provider so
+    # genuine VL models (which pass precomputed embeddings) keep the deferred scatter.
+    if model_cfg.sequence_parallel:
+        try:
+            from megatron.bridge.diffusion.models.nemotron_labs_diffusion.nemotron_labs_diffusion_provider import (
+                NemotronLabsDiffusionModelProvider,
+            )
+        except ImportError:
+            NemotronLabsDiffusionModelProvider = None
+        if NemotronLabsDiffusionModelProvider is not None and isinstance(
+            model_cfg, NemotronLabsDiffusionModelProvider
+        ):
+            model_cfg.scatter_embedding_sequence_parallel = True
     model_cfg.context_parallel_size = config["megatron_cfg"]["context_parallel_size"]
 
     if model_cfg.context_parallel_size > 1:
