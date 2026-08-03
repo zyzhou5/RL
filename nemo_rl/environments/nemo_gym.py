@@ -130,7 +130,21 @@ Depending on your data shape, you may want to change these values."""
             nemo_rl_results = []
             for task in nemo_gym_result_iterator:
                 with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except Exception as _gym_exc:
+                        # Unmask gym /run failures: aiohttp ClientResponseError carries
+                        # CIMultiDictProxy headers that ray cannot pickle, which hides the real
+                        # cause behind "can't pickle CIMultiDictProxy". Re-raise a picklable error
+                        # with the response body (attached as .response_content by
+                        # server_utils.raise_for_status) so the true HTTP error surfaces.
+                        _body = getattr(_gym_exc, "response_content", b"")
+                        _status = getattr(_gym_exc, "status", "?")
+                        if isinstance(_body, (bytes, bytearray)):
+                            _body = _body.decode("utf-8", "replace")
+                        raise RuntimeError(
+                            f"NemoGym rollout failed (HTTP {_status}): {str(_body)[:2000]}"
+                        ) from None
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
                     nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
@@ -209,16 +223,21 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                     ),
                 }
             )
-            nemo_rl_message_log.append(
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
-                    "generation_logprobs": torch.tensor(
-                        output_item_dict["generation_log_probs"]
-                    ),
-                }
-            )
+            assistant_msg = {
+                "role": "assistant",
+                "content": "",
+                "token_ids": torch.tensor(output_item_dict["generation_token_ids"]),
+                "generation_logprobs": torch.tensor(
+                    output_item_dict["generation_log_probs"]
+                ),
+            }
+            # JustGRPO-Fast: carry per-token generation entropy into the message_log
+            # (consumed by require_generation_entropy / build_block_topk_offsets).
+            if output_item_dict.get("generation_entropy") is not None:
+                assistant_msg["generation_entropy"] = torch.tensor(
+                    output_item_dict["generation_entropy"]
+                )
+            nemo_rl_message_log.append(assistant_msg)
 
             seen_token_ids.extend(nemo_rl_message_log[-2]["token_ids"])
             seen_token_ids.extend(nemo_rl_message_log[-1]["token_ids"])
@@ -231,6 +250,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 output_item_dict.pop("generation_token_ids")
             )
             output_item_dict.pop("generation_log_probs")
+            output_item_dict.pop("generation_entropy", None)
 
         if not nemo_rl_message_log:
             input_messages = nemo_gym_result["responses_create_params"]["input"]

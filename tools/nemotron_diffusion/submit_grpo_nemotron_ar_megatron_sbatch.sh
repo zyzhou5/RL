@@ -17,6 +17,7 @@ for arg in "$@"; do
     --sbatch) MODE="sbatch" ;;
     --local)  MODE="local" ;;
     --run)    MODE="run" ;;
+    --build-env) MODE="build-env" ;;
     *) echo "Unknown flag: ${arg}" >&2; exit 1 ;;
   esac
 done
@@ -37,6 +38,10 @@ export DEPENDENCY="${DEPENDENCY:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export REPO_DIR="${REPO_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 export CONFIG="${CONFIG:-examples/configs/gsm8k_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml}"
+# Entry script + uv extras are parameterized so the same launcher can drive the
+# NeMo-Gym path (run_grpo_nemo_gym.py + nemo_gym extra). Defaults = plain GRPO.
+export RUN_SCRIPT="${RUN_SCRIPT:-examples/run_grpo.py}"
+export UV_EXTRAS="${UV_EXTRAS:-mcore}"
 
 export RUN_NAME="${RUN_NAME:-grpo_nemotron_ar_megatron_policy_5k}"
 export RUN_ROOT="${RUN_ROOT:-/lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl}"
@@ -173,11 +178,13 @@ run_training() {
     megatron_env_vars="${megatron_env_vars},PYTORCH_CUDA_ALLOC_CONF:\"expandable_segments:True\""
   fi
 
+  uv_extra_args=()
+  for _e in ${UV_EXTRAS}; do uv_extra_args+=(--extra "${_e}"); done
   uv run \
     "${reinstall_args[@]}" \
-    --extra mcore \
+    "${uv_extra_args[@]}" \
     --with onnx==1.19.1 \
-    python examples/run_grpo.py \
+    python "${RUN_SCRIPT}" \
     --config "${CONFIG}" \
     "checkpointing.checkpoint_dir=${CHECKPOINT_DIR}" \
     checkpointing.save_optimizer=true \
@@ -189,6 +196,32 @@ run_training() {
     "${extra_config_overrides[@]}" \
     2>&1 | tee -a "${RUNDIR}/run.log"
 }
+
+build_env() {
+  # Pre-build the driver uv env (dep resolution + mcore/TE CUDA builds) keyed by
+  # ENV_TAG using UV_EXTRAS. Run on a CPU node inside the container (needs nvcc,
+  # not a live GPU). Worker venvs still build on the first GPU run, but this warms
+  # the uv cache so they are faster.
+  cd "${REPO_DIR}"
+  # Persist the uv-managed Python on lustre (matches run_training); without this the
+  # managed interpreter lands under the container's ephemeral /root and the env is
+  # unusable at GPU-run time (pyvenv.cfg home=/root/.local/share/uv/python).
+  export HOME="${CONTAINER_HOME:-/lustre/fsw/portfolios/coreai/users/snorouzi/container_home}"
+  if [[ -z "${UV_PROJECT_ENVIRONMENT:-}" || "${UV_PROJECT_ENVIRONMENT:-}" == "/opt/nemo_rl_venv" ]]; then
+    export UV_PROJECT_ENVIRONMENT="/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_${ENV_TAG}"
+  fi
+  export UV_CACHE_DIR="${UV_CACHE_DIR:-/lustre/fsw/portfolios/coreai/users/snorouzi/uv_cache_${ENV_TAG}}"
+  unset PYTHONPATH
+  uv_extra_args=()
+  for _e in ${UV_EXTRAS}; do uv_extra_args+=(--extra "${_e}"); done
+  echo "[build-env] ENV_TAG=${ENV_TAG} extras='${UV_EXTRAS}' -> ${UV_PROJECT_ENVIRONMENT}"
+  uv run "${uv_extra_args[@]}" --with onnx==1.19.1 python -c "print('[build-env] driver env ready')"
+}
+
+if [[ "${MODE}" == "build-env" ]]; then
+  build_env
+  exit 0
+fi
 
 if [[ "${MODE}" == "local" || "${MODE}" == "run" ]]; then
   run_training

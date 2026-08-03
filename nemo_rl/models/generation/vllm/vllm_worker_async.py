@@ -320,8 +320,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             TokenizeCompletionRequest,
             TokenizeResponse,
         )
+        # vLLM >=0.24 renamed OpenAIServingTokenization -> ServingTokenization.
         from vllm.entrypoints.serve.tokenize.serving import (
-            OpenAIServingTokenization,
+            ServingTokenization as OpenAIServingTokenization,
         )
         from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
         from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
@@ -361,7 +362,11 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 return super().model_post_init(context)
 
         class NeMoRLOpenAIServingMixin:
-            async def _preprocess_chat(
+            # vLLM 0.25 moved chat preprocessing to
+            # OnlineRenderer.preprocess_chat (tool_parser/reasoning_parser were
+            # folded into a single `parser`), so this override now applies via
+            # the renderer subclass.
+            async def preprocess_chat(
                 self,
                 request,
                 messages,
@@ -369,42 +374,44 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                 default_template_content_format,
                 default_template_kwargs,
                 tool_dicts=None,
-                tool_parser=None,
+                parser=None,
+                *,
+                skip_mm_cache: bool = False,
             ):
-                # Materialize the message tool calls so we can deepcopy below.
+                from vllm.exceptions import VLLMValidationError
+
                 for message in messages:
                     if message.get("tool_calls"):
                         message["tool_calls"] = list(message["tool_calls"])
 
-                # Deepcopy messages here since _preprocess_chat may be destructive.
                 messages_for_replace_prefix_tokens = deepcopy(messages)
 
-                # res is (conversation, [engine_prompt])
                 try:
-                    res = await super()._preprocess_chat(
+                    res = await super().preprocess_chat(
                         request=request,
                         messages=messages,
                         default_template=default_template,
                         default_template_content_format=default_template_content_format,
                         default_template_kwargs=default_template_kwargs,
                         tool_dicts=tool_dicts,
-                        tool_parser=tool_parser,
+                        parser=parser,
+                        skip_mm_cache=skip_mm_cache,
                     )
-                except ValueError as e:
+                except (ValueError, VLLMValidationError) as e:
                     if "maximum context length" in str(e):
                         import logging
 
-                        # Print a clean one-liner warning that max model length has been exceeded
-                        # The exception is still raised, but later filtered out by the MaxContextLengthFilter
                         logging.getLogger(__name__).warning(
                             "Prompt exceeds max_model_len: %s", e
                         )
                     raise
 
-                if request.required_prefix_token_ids is None:
+                if (
+                    not hasattr(request, "required_prefix_token_ids")
+                    or request.required_prefix_token_ids is None
+                ):
                     return res
 
-                # Find the last assistant message
                 last_assistant_message_idx = None
                 for i in reversed(range(len(messages_for_replace_prefix_tokens))):
                     if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
@@ -412,52 +419,42 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
                         break
 
                 if last_assistant_message_idx is None:
-                    # If there's no assistant message, we just use the entire thing.
                     messages_to_last_assistant_message = (
                         messages_for_replace_prefix_tokens
                     )
                 else:
-                    # Include the last assistant message itself.
                     messages_to_last_assistant_message = (
                         messages_for_replace_prefix_tokens[
                             : last_assistant_message_idx + 1
                         ]
                     )
 
-                # For the prefix token calculation, we need add_generation_prompt=False
-                # to get tokens up to (and including) the last assistant message only.
-                # add_generation_prompt is a field on the request that gets embedded
-                # into ChatParams via build_chat_params().
                 modified_request = request.model_copy(
                     update={"add_generation_prompt": False}
                 )
 
-                # Call the actual preprocess chat subroutine so we don't miss anything. Whatever they do is whatever we do since we literally do what they do.
-                corresponding_res = await super()._preprocess_chat(
+                corresponding_res = await super().preprocess_chat(
                     request=modified_request,
                     messages=messages_to_last_assistant_message,
                     default_template=default_template,
                     default_template_content_format=default_template_content_format,
                     default_template_kwargs=default_template_kwargs,
                     tool_dicts=tool_dicts,
-                    tool_parser=tool_parser,
+                    parser=parser,
+                    skip_mm_cache=skip_mm_cache,
                 )
                 actual_corresponding_token_ids = corresponding_res[1][0][
                     "prompt_token_ids"
                 ]
 
-                engine_prompt = res[1][
-                    0
-                ]  # We need to modify engine_prompt.prompt_token_ids
+                engine_prompt = res[1][0]
 
-                final_prompt_token_ids = _replace_prefix_tokens(
+                engine_prompt["prompt_token_ids"] = _replace_prefix_tokens(
                     tokenizer=self.renderer.tokenizer,
                     model_prefix_token_ids=request.required_prefix_token_ids,
                     template_prefix_token_ids=actual_corresponding_token_ids,
                     template_token_ids=engine_prompt["prompt_token_ids"],
                 )
-
-                engine_prompt["prompt_token_ids"] = final_prompt_token_ids
 
                 return res
 
@@ -471,8 +468,7 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         ):
             required_prefix_token_ids: Optional[List[int]] = None
 
-        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingChat
-        class NeMoRLOpenAIServingChat(NeMoRLOpenAIServingMixin, OpenAIServingChat):
+        class NeMoRLOpenAIServingChat(OpenAIServingChat):
             pass
 
         serving_chat_default_kwargs = dict(
@@ -484,10 +480,33 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         serving_chat_kwargs = serving_chat_default_kwargs | self.cfg["vllm_cfg"].get(
             "http_server_serving_chat_kwargs", dict()
         )
+        # vLLM >=0.24: chat/tokenize serving objects delegate message
+        # preprocessing to a shared OnlineRenderer (built from the engine's
+        # renderer + model_config), which they now require as a constructor arg.
+        # Mirrors vllm.entrypoints.openai.api_server.init_app_state.
+        from vllm.renderers.online_renderer import OnlineRenderer
+
+        class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
+            pass
+
+        online_renderer = NeMoRLOnlineRenderer(
+            model_config=engine_client.model_config,
+            renderer=engine_client.renderer,
+            request_logger=serving_chat_kwargs["request_logger"],
+            chat_template=serving_chat_kwargs["chat_template"],
+            chat_template_content_format=serving_chat_kwargs[
+                "chat_template_content_format"
+            ],
+            # enable_auto_tools isn't in serving_chat_default_kwargs, so default it.
+            enable_auto_tools=serving_chat_kwargs.get("enable_auto_tools", False),
+            tool_parser=serving_chat_kwargs.get("tool_parser"),
+            reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
+        )
         serving_chat_kwargs.update(
             dict(
                 engine_client=engine_client,
                 models=openai_serving_models,
+                online_renderer=online_renderer,
                 return_tokens_as_token_ids=True,
             )
         )
@@ -512,9 +531,32 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             assert request.temperature == generation_config["temperature"]
             assert request.top_p == generation_config["top_p"]
 
-            generator = await openai_serving_chat.create_chat_completion(
-                request, raw_request
-            )
+            try:
+                generator = await openai_serving_chat.create_chat_completion(
+                    request, raw_request
+                )
+            except Exception as e:
+                # A prompt longer than max_model_len raises VLLMValidationError during
+                # rendering (before vLLM's normal ErrorResponse path), which would
+                # otherwise escape as HTTP 500. Surface context-length overflows as
+                # HTTP 400 with a "context length" message so the NeMo-Gym vllm_model
+                # adapter drops that rollout gracefully (empty completion) instead of
+                # cascading a 500 that crashes the whole training step. On the Gym path
+                # a handful of over-long prompts out of a large dataset is expected.
+                from vllm.exceptions import VLLMValidationError
+
+                if isinstance(e, VLLMValidationError) and "context length" in str(e):
+                    return JSONResponse(
+                        content={
+                            "object": "error",
+                            "message": str(e),
+                            "type": "BadRequestError",
+                            "param": None,
+                            "code": 400,
+                        },
+                        status_code=400,
+                    )
+                raise
 
             if isinstance(generator, ErrorResponse):
                 return JSONResponse(
@@ -540,23 +582,20 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
             TokenizeCompletionRequest, NeMoRLTokenizeChatRequest
         ]
 
-        # This MRO is necessary i.e. NeMoRLOpenAIServingMixin > OpenAIServingTokenization
-        class NeMoRLOpenAIServingTokenization(
-            NeMoRLOpenAIServingMixin, OpenAIServingTokenization
-        ):
+        class NeMoRLOpenAIServingTokenization(OpenAIServingTokenization):
             pass
 
-        serving_tokenization_kwargs = dict(
+        # vLLM >=0.24 ServingTokenization signature: (models, online_renderer, ...).
+        # Reuse the objects already in serving_chat_kwargs (was engine_client+models
+        # upstream); only swap engine_client -> online_renderer to stay minimal.
+        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
+            models=serving_chat_kwargs["models"],
+            online_renderer=serving_chat_kwargs["online_renderer"],
             request_logger=serving_chat_kwargs["request_logger"],
             chat_template=serving_chat_kwargs["chat_template"],
             chat_template_content_format=serving_chat_kwargs[
                 "chat_template_content_format"
             ],
-            engine_client=serving_chat_kwargs["engine_client"],
-            models=serving_chat_kwargs["models"],
-        )
-        openai_serving_tokenization = NeMoRLOpenAIServingTokenization(
-            **serving_tokenization_kwargs
         )
 
         @app.post("/tokenize")
@@ -633,7 +672,16 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         ########################################
 
         node_ip = _get_node_ip_local()
-        free_port = _get_free_port_local()
+        # Reserve the port by HOLDING an open bound socket. _get_free_port_local() closes its socket
+        # and releases the port -> TOCTOU race: 8 concurrent gen engines/node can grab the same port
+        # and one fails uvicorn bind with [Errno 98] address already in use, leaving a dead endpoint
+        # that stalls rollouts (buffer stuck). Bind here, keep the socket open, hand it to uvicorn.
+        import socket as _socket
+
+        _bound_sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        _bound_sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        _bound_sock.bind(("0.0.0.0", 0))
+        free_port = _bound_sock.getsockname()[1]
 
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
@@ -658,7 +706,9 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
         uvicorn_logger = getLogger("uvicorn.access")
         uvicorn_logger.addFilter(No200Filter())
 
-        thread = threading.Thread(target=server.run, daemon=True)
+        thread = threading.Thread(
+            target=lambda: server.run(sockets=[_bound_sock]), daemon=True
+        )
         thread.start()
 
         return thread, base_url, server

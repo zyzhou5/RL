@@ -1,0 +1,139 @@
+# BlockJustGRPO-Fast (entropy-sparsified 0.25) on the v30 deterministic split (14 no-model-judge
+# agents) with the vLLM diffusion backend + async-GRPO + NeMo-Gym data routing.
+#
+# Inherits the async-GRPO deepscaler vLLM base (non-colocated 16+2, async_engine,
+# staleness <= 1, importance-sampling correction, block-reveal estimator, canvas 16;
+# grpo 128x8 / tgbs 1024 / 5000 steps / skip_reference_policy_logprobs / max_new_tokens
+# 3744 all inherited) and overrides ONLY the deltas below.
+#
+# Fast (entropy-sparsified block-reveal) is ON: fast_entropy_level_ratio 0.25; the entropy
+# channel now traverses the Gym HTTP path (engine+proxy return_entropy: true, plumbed).
+#
+# Requires: NRL_VLLM_PY_EXECUTABLE=<vllm-runtime-venv>/bin/python-compat + nemo_gym
+# uv extra; launch via the disaggregated Gym launcher.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_megatron.yaml"
+
+cluster:
+  num_nodes: 15                      # 12 train + 3 gen (run-specific; see policy.generation.colocated.resources)
+
+grpo:
+  val_period: 10                     # every 10 steps (~1 per 4h window at ~16min/step); base inherits 10
+  max_val_samples: null              # REQUIRED null on the nemo_gym path (base sets 2000)
+  num_prompts_per_step: 120          # base inherits 128
+  num_generations_per_prompt: 8
+  max_num_steps: 50                  # short prod run (base inherits 5000)
+
+policy:
+  # NOTE: base config is 3B; this run uses the 8B v1.5-sft checkpoint (model_name below).
+  model_name: /lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-8B-v1.5-sft
+  train_global_batch_size: 960       # 120 x 8 (base inherits 1024)
+  max_total_sequence_length: 49152   # 48k (base 4096): covers the 39,217-token max prompt + generation
+  generation:
+    max_new_tokens: 4096             # base inherits 3744
+    # Gym forbids NeMo-RL stop criteria and requires EMPTY LISTS (base sets
+    # stop_token_ids [11] / stop_strings null, which trip the assert; [] != null).
+    stop_token_ids: []
+    stop_strings: []
+    vllm_cfg:
+      enforce_eager: true
+      expose_http_server: true       # Gym routes the responses API to AsyncLLM (base is already async_engine)
+      # Tool calling: the gym agent sends tool_choice=auto; vLLM rejects it (400) unless the OpenAI
+      # serving is built with enable_auto_tools + a tool_parser. The model emits its own XML format
+      # <tool_call><function=NAME><parameter=KEY>value</parameter></function></tool_call>, which the
+      # `step3p5` parser matches exactly (tool_parsers/step3p5_tool_parser.py).
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: step3p5
+    vllm_kwargs:
+      diffusion_config:
+        return_entropy: true   # ENGINE-side (JustGRPO-Fast): model emits per-token entropy as a 2nd logprob column keyed by mask_token_id. vllm_kwargs is a SIBLING of vllm_cfg (what the engine reads via vllm_worker.py:149); deep-merges with parent vllm_kwargs.diffusion_config (canvas_length/selection_policy/temperature).
+    colocated:
+      resources:
+        num_nodes: 3                 # 3 gen nodes (12 train + 3 gen = 15; run-specific)
+  # 48k sequence sharded TP=8 x CP=2 (block-JustGRPO CP path; allow_unpacked required
+  # for the asymmetric attention). sequence_parallel ON now that SP+CP is supported
+  # (step-40 prod ran SP off; re-enabled here -- worth a smoke check).
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    context_parallel_size: 2
+    allow_unpacked_context_parallel: true
+    sequence_parallel: true
+    env_vars:
+      PYTHONPATH: /lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_runtime_patches
+      TORCHINDUCTOR_COMPILE_THREADS: '1'      # async-compile race fix; keep quoted (Ray Dict[str,str])
+      # TODO(autotune): MODE=default keeps flex-attention autotune OFF (chosen for
+      # stability -- autotune triggered NCCL timeouts at dp=64 scale). Revisit
+      # enabling autotune for the compile-mode speedup once the timeout interaction
+      # is understood.
+      DIFFU_FLEX_COMPILE_MODE: default        # flex attention compile mode; autotune OFF (see TODO)
+      DIFFU_FLEX_COMPILE_DYNAMIC: 'yes'       # keep quoted (bareword yes -> YAML bool)
+  logprob_estimation:
+    fast_entropy_level_ratio: 0.25            # Fast: keep top 25% highest-entropy reveal levels
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    uv_venv_dir: "/lustre/fsw/portfolios/coreai/users/snorouzi/gym_venvs"      # Gym per-server venvs OFF the 10G home (default PARENT_DIR=home)
+    uv_cache_dir: "/lustre/fsw/portfolios/coreai/users/snorouzi/gym_cache/uv"  # Gym uv cache OFF home (default CACHE_DIR/uv=home)
+    skip_venv_if_present: true                                                  # reuse pre-built venvs (avoid concurrent-install race)
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml                                   # policy -> vLLM (NOT sglang)
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml                                         # judge OFF -> math_verify (local)
+      - resources_servers/code_gen/configs/code_gen.yaml                                                       # local Ray-subprocess exec
+      - resources_servers/mcqa/configs/mcqa.yaml
+      - resources_servers/instruction_following/configs/instruction_following.yaml
+      - resources_servers/structured_outputs/configs/structured_outputs_json_yaml_xml_v1.yaml
+      - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/single_step_tool_use_with_argument_comparison/configs/search_pivot_single_step_tool_use_with_argument_comparison.yaml
+      - resources_servers/terminus_judge/configs/terminal_pivot.yaml                               # terminal_pivot (string-only)
+      - resources_servers/ns_tools/configs/ns_tools.yaml
+      - resources_servers/calendar/configs/calendar.yaml
+      - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+      # - resources_servers/swerl_gen/configs/swerl_gen.yaml   # DROPPED (first run): SWE/singularity sandbox not wired -- see plans/block_justgrpo_vllm_nemogym_v30.md
+      # - resources_servers/math_formal_lean/configs/math_formal_lean_multi_turn.yaml   # DROPPED (first run): Lean nemo-skills sandbox not wired -- see plans/block_justgrpo_vllm_nemogym_v30.md
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          should_use_judge: false    # local math_verify, no 235B judge
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: 2048
+          unit_test_timeout_secs: 10
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 8
+          return_entropy: true   # PROXY-side (JustGRPO-Fast): proxy requests top_logprobs=2 (both sampled+mask entries survive the OpenAI formatter) + reads per-token entropy from the mask-token slot   # multi-worker uvicorn for the CPU-bound proxy (Responses<->Chat + logprob extraction); connector budget auto-divided (Gym#1054 backport)
+
+data:
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 1
+  train:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/train_registered12_heldout.jsonl"
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/val_broad.jsonl"
+    repeat: 4               # avg@4 (was inherited repeat:16 -> 240x16=3840 gens, ~23min, overloaded gen server). 240x4=960.
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-vllm-block-justgrpo-async-grpo-nemogym-v30"
+  save_period: 5
+  metric_name: "val:total_reward/mean"
+  higher_is_better: true
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-block-justgrpo-async-grpo-nemogym-v30"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_block_async_grpo_nemogym_v30"
