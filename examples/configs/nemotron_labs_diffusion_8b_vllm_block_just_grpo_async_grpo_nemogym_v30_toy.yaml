@@ -1,0 +1,31 @@
+# Toy smoke of the v30 NON-DEFERRED setup: 3 nodes (2 train + 1 gen), tiny batch,
+# 2 steps, short generation, small balanced val every step. Inherits the full v30
+# config (8B, Fast, TP8xCP2, SP, gym, data, env_vars) and shrinks only compute +
+# validation. Purpose: confirm the committed (non-deferred) code path runs -- server
+# start, rollouts, a training step, and validation (the preprocess_chat/tokenizer path).
+defaults: "nemotron_labs_diffusion_8b_vllm_block_just_grpo_async_grpo_nemogym_v30.yaml"
+
+cluster:
+  num_nodes: 3                       # 2 train + 1 gen
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+  max_num_steps: 2
+  val_period: 1                      # validate every step (smoke: exercise the val path early)
+
+policy:
+  train_global_batch_size: 32        # 4 x 8
+  generation:
+    max_new_tokens: 512              # short gen for a fast smoke
+    colocated:
+      resources:
+        num_nodes: 1                 # 1 dedicated gen node
+
+data:
+  validation:
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/val_toy.jsonl"   # 36 rows, 2/dataset (all 18, incl. tool agents)
+    repeat: 1                        # v30 uses 4; keep smoke val small (36 x 1)
+
+checkpointing:
+  save_period: 100                   # > max_num_steps -> no checkpoint save during smoke

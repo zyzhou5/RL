@@ -1137,8 +1137,12 @@ def run_async_nemo_gym_rollout(
         responses_create_params["temperature"] = generation_config["temperature"]
         responses_create_params["top_p"] = generation_config["top_p"]
 
-        # Max new tokens, just like max_seq_len above is ignored and we rely on the underlying vLLM engine for truncation.
-        # generation_config["max_new_tokens"]
+        # Cap NEW generated tokens on the NeMo-Gym path. vLLM Responses serving maps
+        # max_output_tokens -> SamplingParams.max_tokens (responses/protocol.py:
+        # max_tokens = min(max_output_tokens, default)). Without this, max_new_tokens is
+        # ignored and a long prompt implicitly buys a (max_model_len - prompt_len) generation.
+        if generation_config["max_new_tokens"] is not None:
+            responses_create_params["max_output_tokens"] = generation_config["max_new_tokens"]
 
         row["_rowidx"] = rowidx
 

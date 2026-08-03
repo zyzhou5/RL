@@ -3299,14 +3299,20 @@ def async_grpo_train(
                         train_data,
                         timer=timer,
                     )
-                    reference_logprobs_out = policy.get_reference_policy_logprobs(
-                        train_data,
-                        timer=timer,
-                    )
                     train_data["prev_logprobs"] = fprop_logprobs_out["logprobs"]
-                    train_data["reference_policy_logprobs"] = reference_logprobs_out[
-                        "reference_logprobs"
-                    ]
+                    # Mirror the sync loop: skip the reference-policy pass when
+                    # configured (KL=0). Without this guard the async loop paid a
+                    # full extra logprob pass per step for unused values.
+                    if not master_config["grpo"].get(
+                        "skip_reference_policy_logprobs_calculation"
+                    ):
+                        reference_logprobs_out = policy.get_reference_policy_logprobs(
+                            train_data,
+                            timer=timer,
+                        )
+                        train_data["reference_policy_logprobs"] = reference_logprobs_out[
+                            "reference_logprobs"
+                        ]
                     # Coupled/ESPO K > 1: also carry pairs 1..K-1 prev / reference
                     # logprobs (no-op for the single-pair paths).
                     _maybe_capture_coupled_pair_logprobs(
@@ -3316,13 +3322,16 @@ def async_grpo_train(
                         source_prefix="logprobs",
                         dest_prefix="prev_logprobs",
                     )
-                    _maybe_capture_coupled_pair_logprobs(
-                        train_data=train_data,
-                        logprobs=reference_logprobs_out,
-                        master_config=master_config,
-                        source_prefix="reference_logprobs",
-                        dest_prefix="reference_policy_logprobs",
-                    )
+                    if not master_config["grpo"].get(
+                        "skip_reference_policy_logprobs_calculation"
+                    ):
+                        _maybe_capture_coupled_pair_logprobs(
+                            train_data=train_data,
+                            logprobs=reference_logprobs_out,
+                            master_config=master_config,
+                            source_prefix="reference_logprobs",
+                            dest_prefix="reference_policy_logprobs",
+                        )
 
                     _maybe_set_coupled_sglang_kl_logprobs(
                         policy=policy,

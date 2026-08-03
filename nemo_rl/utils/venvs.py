@@ -87,6 +87,9 @@ def create_local_venv(
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
+    # Force hardlink so worker venvs share inodes with the uv cache (same fs) instead of
+    # copying ~9GB + inodes per venv, which exhausts the shared project quota.
+    env["UV_LINK_MODE"] = "hardlink"
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)

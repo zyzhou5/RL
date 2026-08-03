@@ -1,0 +1,27 @@
+# Block JustGRPO on 6x6 Sudoku, vLLM generation with the ASYNC engine.
+#
+# Identical to grpo_sudoku6x6_block_just_grpo_vllm.yaml except
+# vllm_cfg.async_engine: true (AsyncLLM front-end instead of the synchronous
+# LLM engine). The diffusion backend was only ever validated with the sync
+# engine (linnan and all runs so far), and this branch predates NeMo-RL's
+# async-generation refactor — this config exists to test whether the async
+# path works with the dLLM/spec-decode machinery at all.
+#
+# NOTE: this is only the async ENGINE within ordinary synchronous GRPO steps
+# (generate -> train -> generate). It is NOT full async-GRPO trajectory
+# collection; that path additionally uses AsyncTrajectoryCollector, whose
+# registry entry does not honor NRL_VLLM_PY_EXECUTABLE yet.
+defaults: "grpo_sudoku6x6_block_just_grpo_vllm.yaml"
+
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-block_just_grpo-sudoku6x6-megatron-vllm-async"
+
+logger:
+  log_dir: "logs/grpo-nd3b-block_just_grpo-sudoku6x6-vllm-async"
+  wandb:
+    name: "grpo-nd3b-block_just_grpo-sudoku6x6-vllm-async"

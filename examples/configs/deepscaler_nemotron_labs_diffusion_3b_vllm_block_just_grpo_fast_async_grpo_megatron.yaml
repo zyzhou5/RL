@@ -1,0 +1,29 @@
+# Block JustGRPO-Fast on DeepScaleR with ASYNC vLLM generation + async-GRPO.
+#
+# Entropy-sparsified child of the async-GRPO DeepScaleR vLLM config (16
+# training + 2 generation nodes, AsyncLLM engine, staleness <= 1): keep only
+# the top-50% highest-entropy within-block offsets
+# (fast_entropy_level_ratio=0.5 -> m=ceil(0.5*16)=8 reveal levels / forward
+# passes instead of 16, the ratio used by the production 8B/8K SGLang fast
+# run). vllm_kwargs.diffusion_config.return_entropy makes the vLLM engine
+# emit each token's at-unmask entropy through the logprobs channel; the
+# async generation worker requests logprobs=1 and surfaces it as the
+# optional GenerationOutputSpec "entropy" channel that the offset selection
+# consumes (training fail-fasts via require_generation_entropy if absent).
+defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_megatron.yaml"
+
+policy:
+  logprob_estimation:
+    fast_entropy_level_ratio: 0.5
+  generation:
+    vllm_kwargs:
+      diffusion_config:
+        return_entropy: true
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-block_just_grpo-fast-deepscaler-megatron-vllm-async-grpo"
+
+logger:
+  log_dir: "logs/grpo-nd3b-block_just_grpo-fast-deepscaler-vllm-async-grpo"
+  wandb:
+    name: "grpo-nd3b-block_just_grpo-fast-deepscaler-vllm-async-grpo"
