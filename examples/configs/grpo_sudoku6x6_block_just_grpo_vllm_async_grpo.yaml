@@ -1,0 +1,46 @@
+# Block JustGRPO on 6x6 Sudoku with FULL async-GRPO (overlapped rollout
+# collection, trajectory staleness <= 1 step) on the vLLM async engine.
+#
+# Child of the async-engine config; adds the three things async_grpo_train
+# asserts/requires (nemo_rl/algorithms/grpo.py:2521):
+#   1. grpo.async_grpo.enabled + max_trajectory_age_steps
+#   2. loss_fn.use_importance_sampling_correction: true (off-policy samples)
+#   3. NON-colocated inference: 1 dedicated generation node; remaining
+#      cluster nodes train. First non-colocated run of this stack — weight
+#      refit goes over the network instead of intra-node.
+#
+# Requires the AsyncTrajectoryCollector registry fix (VLLM_EXECUTABLE) so the
+# collector actor runs on the custom vLLM runtime.
+defaults: "grpo_sudoku6x6_block_just_grpo_vllm_async.yaml"
+
+grpo:
+  async_grpo:
+    enabled: true
+    # Trajectories may be at most 1 weight-version old; with age <= 1,
+    # in-flight weight updates are not needed.
+    max_trajectory_age_steps: 1
+
+loss_fn:
+  # Required by async_grpo_train: corrects the off-policy gap between the
+  # behavior policy (generation logprobs -- vLLM at-unmask, gen_kl ~2e-4 vs
+  # recompute) and the current policy.
+  use_importance_sampling_correction: true
+
+policy:
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1   # 1 generation node; cluster.num_nodes - 1 train nodes
+
+cluster:
+  num_nodes: 3   # 2 training + 1 generation
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-block_just_grpo-sudoku6x6-megatron-vllm-async-grpo"
+
+logger:
+  log_dir: "logs/grpo-nd3b-block_just_grpo-sudoku6x6-vllm-async-grpo"
+  wandb:
+    name: "grpo-nd3b-block_just_grpo-sudoku6x6-vllm-async-grpo"

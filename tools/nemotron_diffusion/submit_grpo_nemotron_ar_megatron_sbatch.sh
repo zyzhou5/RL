@@ -181,6 +181,7 @@ run_training() {
   uv_extra_args=()
   for _e in ${UV_EXTRAS}; do uv_extra_args+=(--extra "${_e}"); done
   uv run \
+    --no-sync \
     "${reinstall_args[@]}" \
     "${uv_extra_args[@]}" \
     --with onnx==1.19.1 \
@@ -241,6 +242,7 @@ SBATCH_ARGS=(
   --output="${RUNDIR}/slurm-%j.out"
   --open-mode=append
 )
+[ -n "${SBATCH_EXCLUDE:-}" ] && SBATCH_ARGS+=(--exclude="${SBATCH_EXCLUDE}")
 
 if [[ -n "${DEPENDENCY}" ]]; then
   SBATCH_ARGS+=(--dependency="${DEPENDENCY}")
@@ -257,8 +259,8 @@ if [[ "${NODES}" -gt 1 ]]; then
   export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-/lustre/fsw/portfolios/coreai/users/snorouzi/nemorl_uv_driver_envs/diffusion_RL_RL_${ENV_TAG}}"
   export UV_CACHE_DIR_OVERRIDE="${UV_CACHE_DIR_OVERRIDE:-/lustre/fsw/portfolios/coreai/users/snorouzi/uv_cache_${ENV_TAG}}"
   export RAY_raylet_start_wait_time_s="${RAY_raylet_start_wait_time_s:-240}"
-  export RAY_START_CMD="${RAY_START_CMD:-RAY_raylet_start_wait_time_s=${RAY_raylet_start_wait_time_s} UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} UV_CACHE_DIR=/root/.cache/uv uv run --locked --directory ${REPO_DIR} ray start}"
-  export RAY_STATUS_CMD="${RAY_STATUS_CMD:-UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} UV_CACHE_DIR=/root/.cache/uv uv run --locked --directory ${REPO_DIR} ray status}"
+  export RAY_START_CMD="${RAY_START_CMD:-RAY_raylet_start_wait_time_s=${RAY_raylet_start_wait_time_s} UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} UV_CACHE_DIR=/root/.cache/uv uv run --no-sync --directory ${REPO_DIR} ray start}"
+  export RAY_STATUS_CMD="${RAY_STATUS_CMD:-UV_PROJECT_ENVIRONMENT=${UV_PROJECT_ENVIRONMENT} UV_CACHE_DIR=/root/.cache/uv uv run --no-sync --directory ${REPO_DIR} ray status}"
 
   cd "${REPO_DIR}"
   sbatch "${SBATCH_ARGS[@]}" ray.sub
