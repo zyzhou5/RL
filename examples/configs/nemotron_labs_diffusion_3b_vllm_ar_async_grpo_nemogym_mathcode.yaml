@@ -1,0 +1,56 @@
+# AR GRPO on the same math+code data as the BlockJustGRPO mathcode run, 4 train + 4 gen.
+#
+# Inherits the mathcode config so the whole proven seam is reused unchanged: vLLM +
+# NeMo-Gym + async-GRPO, gym venvs on lustre, the 2-server config_paths, the filtered
+# train/val files, 4k prompt + 4k generation. Only the policy (AR instead of
+# block-reveal) and the node split change.
+#
+# TOPOLOGY RATIONALE. On the 10-node diffusion run (job 15070086) the step was
+#   103.23s = policy_training 44.80s + exposed_generation 43.58s + logprobs 13.47s
+# i.e. already generation-bound at 8 train + 2 gen. AR drops the block-reveal passes
+# (Fast ratio 0.25 x block_size 16 = 4 reveal levels over a [noisy|clean] layout ->
+# a single AR pass), so training gets cheaper by more than generation does, pushing
+# further toward generation-bound. Hence a 1:1 split rather than 4:1.
+#   4 train + 4 gen:  train ~22s + logprob ~7s = ~29s;  gen ~20s  -> gen hidden
+# train_nodes must keep tgbs 1024 divisible by dp = train_nodes * 8:
+#   1/2/4/8/16 train nodes are valid; 3/5/6/7 are NOT (dp=32 here -> 32 per rank).
+# If generation is still exposed, go 4 train + 6 gen. If the trainer starves, 8 + 4.
+#
+# UNVERIFIED -- check on a toy before trusting an 8-node run:
+#  1. `vllm_kwargs.diffusion_config: null` is how AR decoding is selected
+#     (vllm_worker.py:141 does `.get("diffusion_config") or {}`, and the reference
+#     AR config grpo_math_nemotron_diffusion_3b_ar_vllm.yaml uses `vllm_kwargs: {}`).
+#     Confirm the gen workers are NOT running leftmost-reveal.
+#  2. `hf_config_overrides.block_size: 16` is inherited from the block chain. It keeps
+#     the cached HF->mcore conversion (hfovr_addf234ab11a) so there is no conversion
+#     cost, but verify the AR worker wants block-diffusion attention disabled.
+#  3. The estimated AR speedups above are inferred, not measured.
+defaults: "nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_nemogym_mathcode.yaml"
+
+cluster:
+  num_nodes: 8                       # 4 train + 4 gen
+
+policy:
+  # AR policy worker instead of the block-reveal one.
+  worker_cls_fqn: "nemo_rl.models.policy.workers.nemotron_diffusion_megatron_policy_worker.NemotronDiffusionMegatronPolicyWorker"
+
+  # AR has no [noisy|clean] layout and no reveal-level passes, so it fits ~2x the
+  # micro-batch the diffusion path could (matches the AR deepscaler config).
+  train_micro_batch_size: 4
+  logprob_batch_size: 4
+
+  generation:
+    colocated:
+      resources:
+        num_nodes: 4                 # was 2
+    vllm_kwargs:
+      diffusion_config: null         # AR decoding; see note 1 above
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-vllm-ar-async-grpo-nemogym-mathcode"
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-ar-async-grpo-nemogym-mathcode"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_ar_async_grpo_nemogym_mathcode"

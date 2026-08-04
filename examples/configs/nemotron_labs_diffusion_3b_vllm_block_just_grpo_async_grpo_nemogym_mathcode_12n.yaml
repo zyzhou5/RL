@@ -1,0 +1,36 @@
+# Same as the mathcode run, rebalanced 8 train + 4 gen (12 nodes) instead of 8 + 2.
+#
+# Motivation: on the 10-node run (job 15070086) the bottleneck inverted vs the 8B
+# v30 runs. The 3B trains a step in ~45s where the 8B took ~17min, so 2 gen nodes
+# can no longer stay ahead:
+#   Total step time 103.23s = policy_training 44.80s (43.4%)
+#                           + exposed_generation 43.58s (42.2%)
+#                           + logprobs 13.47s (13.0%)
+#   generation delivers 128 groups in ~102s; the trainer needs them in ~58s
+#   group latency ~72s per group of 8, stable
+# Doubling gen capacity should cover the ~1.75x shortfall IF generation is
+# GPU-bound and scales with nodes. If it does NOT hide, the bottleneck is the
+# single NemoGym actor's CPU (code_gen unit tests, num_processes 2048) and gen
+# nodes are the wrong lever -- check exposed_generation in the timing block.
+# Best case is 103.23 -> ~59.7s (1.73x); training time itself is unchanged.
+#
+# train nodes stay at 8 so dp=64 and tgbs 1024 still divides evenly (16/rank).
+defaults: "nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_nemogym_mathcode.yaml"
+
+cluster:
+  num_nodes: 12                      # 8 train + 4 gen
+
+policy:
+  generation:
+    colocated:
+      resources:
+        num_nodes: 4                 # was 2
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-vllm-block-justgrpo-async-grpo-nemogym-mathcode-12n"
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-block-justgrpo-async-grpo-nemogym-mathcode-12n"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_block_async_grpo_nemogym_mathcode_12n"

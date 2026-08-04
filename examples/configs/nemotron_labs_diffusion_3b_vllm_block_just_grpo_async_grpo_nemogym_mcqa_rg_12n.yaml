@@ -1,0 +1,53 @@
+# BlockJustGRPO-Fast on the mcqa + reasoning_gym subsets, 3B, 8 train + 4 gen.
+#
+# WHY THIS MIXTURE. On the math+code run (job 15076481) only 23.0% of prompt groups
+# produced gradient -- the rest were all-fail (0-for-8):
+#   code_gen         2449 groups   78.1% all-fail   21.0% mixed   0.9% all-pass
+#   math_with_judge   879 groups   70.5% all-fail   28.6% mixed   0.9% all-pass
+# and 20 steps moved nothing (train reward flat ~0.084, val 0.1120 -> 0.0885).
+# On the 8B v30 run these two subsets had the highest mixed rates measured:
+#   mcqa 61.9%, reasoning_gym 53.3% (vs tau_pivot 5.0%, search_pivot 0.0%).
+#
+# Data built straight from nano v3, 4096-token prompt filter applied with real
+# tokenization, deterministic stride split:
+#   train_mcqa_rg.jsonl 12,296 rows   val_mcqa_rg.jsonl 256 rows (128/subset)
+#   stem_mcqa      7256 kept, 0 dropped   tok mean 296 p90 373 max 1861
+#   reasoning_gym  5296 kept, 7 dropped   tok mean 226 p90 434 max 3568
+# Mixture is 58% mcqa / 42% reasoning_gym. Only 2 agents: mcqa, reasoning_gym.
+#
+# CAVEAT on reasoning_gym: it is the only graded subset (378 distinct reward values,
+# smallest non-zero ~5e-05, 61% of samples exactly 0.0). GRPO divides by the group
+# std, so a 2e-05 reward spread normalises to an order-1 advantage indistinguishable
+# from a real solve. Its 53.3% "mixed" rate is therefore inflated -- read the
+# per-agent breakdown, not the aggregate. mcqa's binary {0,1} rate is trustworthy.
+#
+# NOTE prompts here are far shorter than math+code (mean ~260 vs ~480 tokens, p90
+# <440). max_total_sequence_length stays 8192 so generation keeps its full 4096
+# budget, but ~2k of the prompt allowance is now unused; 6144 would cut trainer cost.
+defaults: "nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_nemogym_mathcode_12n_nccldbg.yaml"
+
+data:
+  train:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/train_mcqa_rg.jsonl"
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/val_mcqa_rg.jsonl"
+    repeat: 2                        # 256 x 2 = 512 val generations
+
+env:
+  nemo_gym:
+    # only the servers these 2 subsets route to (OmegaConf replaces lists)
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/mcqa/configs/mcqa.yaml
+      - resources_servers/reasoning_gym/configs/reasoning_gym.yaml
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-vllm-block-justgrpo-async-grpo-nemogym-mcqa-rg"
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-block-justgrpo-async-grpo-nemogym-mcqa-rg"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_block_async_grpo_nemogym_mcqa_rg_12n"

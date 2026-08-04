@@ -1,0 +1,51 @@
+# Toy smoke of the AR mathcode setup: 3 nodes (2 train + 1 gen), 8x8, 2 steps,
+# tiny balanced validation every step. Inherits the AR config (worker, 4k+4k,
+# diffusion_config null, gym servers, data) and shrinks ONLY compute + validation.
+#
+# Purpose is correctness, not throughput. Specifically confirm:
+#   1. AR decoding is actually active -- diffusion_config resolves to None and the
+#      gen workers do NOT run leftmost-reveal. Cross-check gen_tokens_per_sample and
+#      step timing against the diffusion toy (job 15044658: 86.9s / 83.3s per step,
+#      val avg_length 847-985 tokens).
+#   2. NemotronDiffusionMegatronPolicyWorker loads with the inherited
+#      hf_config_overrides.block_size 16 and reuses the cached HF->mcore conversion
+#      (hfovr_addf234ab11a) rather than triggering a fresh one.
+#   3. Two training steps complete AND validation produces metrics -- the failure
+#      mode to watch is a step never finishing (exit 0 with no "Total step time",
+#      as in job 15042814).
+#
+# NOTE the toy is 2 train + 1 gen, NOT the 4+4 ratio of the real run: dp = 16 here
+# so tgbs 64 divides evenly. It cannot validate the topology choice, only correctness.
+# Take the training/generation split from the timing block to size the real run.
+defaults: "nemotron_labs_diffusion_3b_vllm_ar_async_grpo_nemogym_mathcode.yaml"
+
+cluster:
+  num_nodes: 3                       # 2 train + 1 gen
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 2
+  val_period: 1                      # validate every step, fail fast on the val path
+
+policy:
+  train_global_batch_size: 64        # 8 x 8; dp=16 -> 4 samples/rank
+  generation:
+    colocated:
+      resources:
+        num_nodes: 1
+
+data:
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/val_mathcode_toy.jsonl"
+    repeat: 1                        # 24 rows x 1
+
+checkpointing:
+  save_period: 100                   # > max_num_steps -> no checkpoint written
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-ar-async-grpo-nemogym-mathcode-toy"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_ar_async_grpo_nemogym_mathcode_toy"

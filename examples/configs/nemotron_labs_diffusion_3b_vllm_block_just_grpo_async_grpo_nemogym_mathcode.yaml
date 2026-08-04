@@ -1,0 +1,89 @@
+# BlockJustGRPO-Fast on the v30 MATH+CODING subset selection, 3B policy.
+#
+# Data: 6 subsets taken straight from nano v3 (curriculum_v30_cobalt-zebra...),
+# split 64-rows-per-subset into validation. No carve-outs inherited from the
+# v30_deterministic pipeline; train/val are disjoint by construction (each row is
+# written to exactly one file).
+#   train_mathcode.jsonl  41,220 rows   val_mathcode.jsonl  384 rows
+#   coding (72%): comp_coding 22,868, nemotronx_code 7,242
+#   math   (28%): skyworks_no_omni 5,318, dapo17k 2,394,
+#                 math_holdout_small_igor 2,361, math_turing 1,421
+# DROPPED:
+#  - terminal_pivot_len40k: shell tasks, ~7.4k prompt tokens, truncated at the 4k cap.
+#  - math_tir_{skywork,holdout_small_igor,turing}: these are the ONLY subsets that
+#    declare a tool (ns_tools PythonTool). When the tool fires the rollout becomes
+#    multi-turn (assistant / tool_response / assistant), which BlockJustGRPO rejects:
+#      ValueError: DiffuGRPO fully-masked completion expects one contiguous
+#      generated completion span per sample  (diffu_grpo_logprobs.py:122)
+#    The estimator represents the completion as a single (start, length) interval,
+#    so a second span would mask+score the tool output and let the first response
+#    attend to the tool answer. Killed toy job 15042814. Revisit if the estimator
+#    learns to emit one training sample per assistant turn.
+# Only 2 agents remain: code_gen, math_with_judge.
+#
+# Sequence budget: 4k prompt + 4k generation = 8192 total (v30 used 49152).
+# Verified: exactly 1 row of 48,727 exceeds the 4k prompt budget, so truncation
+# (which raises "Non-contiguous messages" at nemo_gym.py:210) is a non-issue here.
+#
+# Inherits the 8B v30 config for the whole Gym/vLLM/async-GRPO seam and overrides
+# ONLY the model, parallelism, sequence budget, batch shape, data, and servers.
+defaults: "nemotron_labs_diffusion_8b_vllm_block_just_grpo_async_grpo_nemogym_v30.yaml"
+
+cluster:
+  num_nodes: 10                      # 8 train + 2 gen
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 8
+  max_num_steps: 100
+  val_period: 10
+  max_val_samples: null              # REQUIRED null on the nemo_gym path
+
+policy:
+  # Back to the 3B official checkpoint (v30 overrode this to the 8B v1.5-sft).
+  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B-official"
+  train_global_batch_size: 1024      # 128 x 8; dp=64 -> 16 samples/rank
+  max_total_sequence_length: 8192    # 4k prompt + 4k generation
+
+  generation:
+    max_new_tokens: 4096             # divisible by canvas/block_size 16
+    colocated:
+      resources:
+        num_nodes: 2                 # dedicated generation nodes
+    # vllm_cfg.max_model_len follows ${policy.max_total_sequence_length}
+
+  # 3B at 8k needs none of the 8B's sharding. Reverting TP8 x CP2 x SP retires
+  # the block-aware CP path entirely for this run.
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    allow_unpacked_context_parallel: false
+
+data:
+  max_input_seq_length: 4096         # prompt cap (v30 left this null)
+  train:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/train_mathcode.jsonl"
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/val_mathcode.jsonl"
+    repeat: 2                        # 576 x 2 = 1152 val generations
+
+env:
+  nemo_gym:
+    # Only the servers these 9 subsets route to (OmegaConf replaces lists).
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+      - resources_servers/code_gen/configs/code_gen.yaml
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-vllm-block-justgrpo-async-grpo-nemogym-mathcode"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-block-justgrpo-async-grpo-nemogym-mathcode"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_block_async_grpo_nemogym_mathcode"
