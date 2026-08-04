@@ -3169,6 +3169,17 @@ def async_grpo_train(
                             "⏳ Buffer empty or not enough groups to form a full step, waiting..."
                         )
 
+                        # The collector consumes the dataloader once per epoch and
+                        # stops when max_num_epochs is reached. Without this check the
+                        # trainer would spin here forever on an empty buffer until the
+                        # idle-GPU watchdog kills the job.
+                        if ray.get(trajectory_collector.is_exhausted.remote()):
+                            print(
+                                "🏁 Trajectory collector exhausted all epochs; "
+                                "ending training loop."
+                            )
+                            break
+
                         # Get buffer debug info to help diagnose the issue
                         buffer_debug = ray.get(replay_buffer.get_debug_info.remote())
                         buffer_size = buffer_debug["total_trajectories"]
