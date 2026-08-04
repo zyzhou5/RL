@@ -338,16 +338,41 @@ export NEMO_RL_VENV_DIR=$L/nemo_rl_worker_venvs_<ENV_TAG>
 export UV_CACHE_DIR=$L/uv_cache_<ENV_TAG>
 cd /home/snorouzi/diffusion_RL/RL
 $L/nemorl_uv_driver_envs/diffusion_RL_RL_<ENV_TAG>/bin/python -c "
-from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.utils.venvs import create_local_venv
-for fqn in [\"nemo_rl.algorithms.async_utils.ReplayBuffer\",
-            \"nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector\"]:
-    print(create_local_venv(PY_EXECUTABLES.VLLM, fqn))
+FQNS = [
+    # the policy worker for THIS run -- copy from policy.worker_cls_fqn in the config
+    \"nemo_rl.models.policy.workers.block_just_grpo_megatron_policy_worker.BlockJustGRPOMegatronPolicyWorker\",
+    # async-GRPO only; omit for a synchronous run
+    \"nemo_rl.algorithms.async_utils.ReplayBuffer\",
+    \"nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector\",
+]
+for fqn in FQNS:
+    print(fqn, \"->\", create_local_venv(get_actor_python_env(fqn), fqn))
 "'
 ```
 
 Keep `NEMO_RL_VENV_DIR` / `UV_CACHE_DIR` keyed to the same `ENV_TAG` the run
 will use, for the reason in the previous section.
+
+Build EVERY actor class the run will instantiate, not just the async pair --
+the policy worker is the largest venv (~666 packages) and the slowest stage.
+Use `get_actor_python_env(fqn)` rather than hardcoding an executable: it returns
+the same per-class env the runtime would pick (`--extra mcore` for the Megatron
+policy workers, `--extra vllm` for ReplayBuffer / AsyncTrajectoryCollector), so
+the pre-built venv is byte-for-byte the one the job looks for. Swap the policy
+FQN for whichever worker the config names, e.g.
+`...trace_grpo_megatron_policy_worker.TraceGRPOMegatronPolicyWorker` for Trace.
+
+Verify before submitting -- a complete set looks like:
+
+```bash
+V=/lustre/fsw/portfolios/coreai/users/snorouzi/nemo_rl_worker_venvs_${ENV_TAG}
+for w in $V/*/; do echo "$(basename $w): $(ls $w/lib/python3.13/site-packages | wc -l)"; done
+#   ...BlockJustGRPOMegatronPolicyWorker: 666
+#   ...async_utils.ReplayBuffer:          620
+#   ...async_utils.AsyncTrajectoryCollector: 620
+```
 
 
 ## Env Tag
