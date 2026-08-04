@@ -76,8 +76,8 @@ the current values rather than re-passing them on the command line.
 - **ENV_TAG**: a vLLM/nemo_gym driver-env tag, distinct from the SGLang
   `mb_3rdparty_sglagn_local_fork`, e.g. `mb_3rdparty_vllm_local_fork`. The
   driver env must carry the `nemo_gym` extra; because `--no-sync` will not
-  add it, build this tag once with `NRL_FORCE_REBUILD_VENVS=true` before
-  normal reuse.
+  add it, provision the tag once with `--build-env` and the intended
+  `UV_EXTRAS` (see "Provisioning a New ENV_TAG" below) before normal reuse.
 
 ### `NRL_VLLM_PY_EXECUTABLE`
 
@@ -257,6 +257,98 @@ provision the env deliberately once -- run with `NRL_FORCE_REBUILD_VENVS=true`
 fresh env -- before going back to normal `--no-sync` reuse. Source-only edits to
 editable trees (`nemo_rl/...`, an editable `sglang` or vLLM checkout) are
 unaffected and need no sync.
+
+## Provisioning a New ENV_TAG (`--build-env`)
+
+A training submit runs `uv run --no-sync` (see above), so it will **never
+create the driver env**. A brand-new `ENV_TAG` must be provisioned once, up
+front, with the launcher's `--build-env` mode -- that path runs `uv run` *with*
+sync and is the only thing that materializes
+`nemorl_uv_driver_envs/diffusion_RL_RL_${ENV_TAG}`. Skip it and bringup fails
+with confusing ray import / `Failed to read metadata` errors rather than a
+clear "env missing" message.
+
+Run it inside the container on a compute node -- it needs nvcc for the mcore /
+TransformerEngine builds, which login nodes do not have:
+
+```bash
+srun -A coreai_dlalgo_llm --partition interactive --time 1:30:00 --nodes=1 --gpus-per-node=8 \
+  --container-image /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/sfawzy/nemo-rl-nightly.sqsh \
+  --container-mounts=/home/snorouzi:/home/snorouzi,/lustre:/lustre \
+  bash -lc 'cd /home/snorouzi/diffusion_RL/RL && \
+    ENV_TAG=<new_tag> \
+    UV_EXTRAS="mcore nemo_gym" \
+    bash tools/nemotron_diffusion/submit_grpo_nemotron_ar_megatron_sbatch.sh --build-env'
+```
+
+Budget 30-45 min for a cold tag (TransformerEngine compiles from source); later
+runs reusing the tag are fast. Pass the same `UV_EXTRAS` you intend to run with
+-- `--no-sync` cannot add an extra later, so a tag built without `nemo_gym`
+stays without it.
+
+### Do NOT override `UV_CACHE_DIR` / `UV_CACHE_DIR_OVERRIDE`
+
+Leave both unset, at build time and at submit time. `ENV_TAG` already derives
+them consistently, and the run depends on that consistency:
+
+```text
+wrapper:94    UV_CACHE_DIR="${UV_CACHE_DIR:-.../uv_cache_${ENV_TAG}}"                    # driver side
+wrapper:261   UV_CACHE_DIR_OVERRIDE="${UV_CACHE_DIR_OVERRIDE:-.../uv_cache_${ENV_TAG}}"
+ray.sub:105   MOUNTS+=",$UV_CACHE_DIR_OVERRIDE:/root/.cache/uv"                          # in-container uv
+```
+
+### Pre-build the per-actor worker venvs (or the idle-GPU watchdog kills the run)
+
+`--build-env` provisions only the DRIVER env. Each Ray actor class additionally
+gets its own venv under `nemo_rl_worker_venvs_${ENV_TAG}/<actor-FQN>`, built
+LAZILY by `_env_builder` the first time the driver instantiates that class
+(`nemo_rl/utils/venvs.py`). On a fresh tag they are built in two separate
+stages:
+
+- the Megatron policy worker -- during `setup()`
+  (`grpo.py:806 initialize_generation_with_policy`)
+- `ReplayBuffer` + `AsyncTrajectoryCollector` -- much later, inside
+  `async_grpo_train` (`grpo.py:2971` / `grpo.py:3006`), i.e. AFTER the model
+  is initialized
+
+The vLLM generation workers build nothing -- they run on
+`NRL_VLLM_PY_EXECUTABLE` directly.
+
+Both stages leave every GPU in the allocation idle. On a fresh tag that easily
+exceeds 30 minutes, and `svc-hwinf-cs-sched` (uid 146504) reaps idle-GPU jobs at
+~31 min:
+
+```text
+sacct -j <id>  ->  CANCELLED by 146504 | 0:0 | 00:30:42
+```
+
+The job is not broken; it never got to use a GPU in time. So pre-build the
+venvs on ONE node first, then submit the real multi-node run. `_env_builder`
+early-returns when `<venv>/bin/python` already exists, so the run just picks
+them up:
+
+```bash
+srun -A coreai_dlalgo_llm --partition interactive --time 0:50:00 --nodes=1 --gpus-per-node=8 \
+  --container-image /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_llm/users/sfawzy/nemo-rl-nightly.sqsh \
+  --container-mounts=/home/snorouzi:/home/snorouzi,/lustre:/lustre \
+  bash -lc '
+L=/lustre/fsw/portfolios/coreai/users/snorouzi
+export HOME=$L/container_home
+export NEMO_RL_VENV_DIR=$L/nemo_rl_worker_venvs_<ENV_TAG>
+export UV_CACHE_DIR=$L/uv_cache_<ENV_TAG>
+cd /home/snorouzi/diffusion_RL/RL
+$L/nemorl_uv_driver_envs/diffusion_RL_RL_<ENV_TAG>/bin/python -c "
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+from nemo_rl.utils.venvs import create_local_venv
+for fqn in [\"nemo_rl.algorithms.async_utils.ReplayBuffer\",
+            \"nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector\"]:
+    print(create_local_venv(PY_EXECUTABLES.VLLM, fqn))
+"'
+```
+
+Keep `NEMO_RL_VENV_DIR` / `UV_CACHE_DIR` keyed to the same `ENV_TAG` the run
+will use, for the reason in the previous section.
+
 
 ## Env Tag
 
