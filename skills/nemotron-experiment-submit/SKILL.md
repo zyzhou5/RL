@@ -74,7 +74,7 @@ the current values rather than re-passing them on the command line.
 - **vLLM runtime**: `NRL_VLLM_PY_EXECUTABLE=<vllm-runtime-venv>/bin/python-compat`
   -- see below.
 - **ENV_TAG**: a vLLM/nemo_gym driver-env tag, distinct from the SGLang
-  `mb_3rdparty_sglagn_local_fork`, e.g. `mb_3rdparty_vllm_local_fork`. The
+  `mb_3rdparty_sglagn_local_fork`, e.g. `mb_3rdparty_vllm_local_fork_fixed`. The
   driver env must carry the `nemo_gym` extra; because `--no-sync` will not
   add it, provision the tag once with `--build-env` and the intended
   `UV_EXTRAS` (see "Provisioning a New ENV_TAG" below) before normal reuse.
@@ -126,7 +126,7 @@ ACCOUNT=coreai_dlalgo_genai \
 PARTITION=batch \
 TIME=00:40:00 \
 NODES=3 \
-ENV_TAG=mb_3rdparty_vllm_local_fork \
+ENV_TAG=mb_3rdparty_vllm_local_fork_fixed \
 RUN_SCRIPT=examples/nemo_gym/run_grpo_nemo_gym.py \
 UV_EXTRAS="mcore nemo_gym" \
 NEMO_GYM_VENV_DIR=/lustre/fsw/portfolios/coreai/users/snorouzi/gym_venvs \

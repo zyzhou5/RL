@@ -147,15 +147,22 @@ class VllmInternalWorkerExtension:
         "confidence_threshold",
     )
 
-    @staticmethod
-    def _read_selection_policy(sampler: Any) -> str:
+    # Sampler flag that selects each policy. "low_confidence" is the default
+    # (every flag false) and has no flag of its own. Not every build defines
+    # every flag: engine builds that predate a policy simply omit it, so these
+    # are always accessed defensively.
+    _DLLM_POLICY_FLAGS = {
+        "leftmost": "leftmost",
+        "random": "random_mode",
+        "confidence_threshold": "threshold_mode",
+    }
+
+    @classmethod
+    def _read_selection_policy(cls, sampler: Any) -> str:
         """Recover the policy name from the booleans the sampler keeps it as."""
-        if sampler.leftmost:
-            return "leftmost"
-        if sampler.random_mode:
-            return "random"
-        if sampler.threshold_mode:
-            return "confidence_threshold"
+        for policy, flag in cls._DLLM_POLICY_FLAGS.items():
+            if getattr(sampler, flag, False):
+                return policy
         return "low_confidence"
 
     def _write_selection_policy(self, sampler: Any, policy: str) -> None:
@@ -164,12 +171,20 @@ class VllmInternalWorkerExtension:
                 f"Unknown diffusion selection_policy {policy!r}; expected one of "
                 f"{list(self._DLLM_SELECTION_POLICIES)}."
             )
-        # The sampler stores the policy pre-derived as three mutually exclusive
-        # booleans, so all three are rewritten together -- setting only one would
-        # leave the engine in a state the loader could never produce.
-        sampler.leftmost = policy == "leftmost"
-        sampler.random_mode = policy == "random"
-        sampler.threshold_mode = policy == "confidence_threshold"
+        flag = self._DLLM_POLICY_FLAGS.get(policy)
+        if flag is not None and not hasattr(sampler, flag):
+            # Writing a flag this build never reads would silently decode under
+            # low_confidence instead of what was asked for, so refuse.
+            raise RuntimeError(
+                f"This vLLM build's diffusion sampler has no {flag!r}, so it "
+                f"cannot decode with selection_policy={policy!r}."
+            )
+        # The sampler stores the policy pre-derived as mutually exclusive
+        # booleans, so every flag it does define is rewritten together --
+        # setting only one would leave a state the loader could never produce.
+        for name, attr in self._DLLM_POLICY_FLAGS.items():
+            if hasattr(sampler, attr):
+                setattr(sampler, attr, policy == name)
 
     def reconfigure_dllm(
         self, overrides: dict[str, Any] | None = None

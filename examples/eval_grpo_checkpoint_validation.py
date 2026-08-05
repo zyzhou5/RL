@@ -87,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--venv", type=Path, default=DEFAULT_VENV)
     parser.add_argument("--server-random-seed", type=int, default=None)
     parser.add_argument("--cuda-visible-devices", default=None)
+    parser.add_argument("--backend", choices=("sglang", "vllm"), default="sglang")
+    parser.add_argument(
+        "--vllm-python",
+        default="/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_reveal_steps/bin/python-compat",
+    )
 
     parser.add_argument("--max-new-tokens", type=int, default=750)
     parser.add_argument("--context-length", type=int, default=1024)
@@ -211,7 +216,7 @@ def score_response(verify_func: Any, response: str, gold: str) -> tuple[float, A
 
 def write_dllm_config(args: argparse.Namespace) -> Path | None:
     args.outdir.mkdir(parents=True, exist_ok=True)
-    if args.dllm_algorithm == "AR":
+    if args.dllm_algorithm == "AR" or args.backend == "vllm":
         return None
 
     config_path = args.outdir / "dllm_config.yaml"
@@ -250,6 +255,63 @@ def check_sglang_commit(repo: Path, expected: str) -> None:
 
 
 def server_command(args: argparse.Namespace, dllm_config: Path | None) -> list[str]:
+    if args.backend == "vllm":
+        cmd = [
+            str(args.vllm_python),
+            "-m",
+            "vllm.entrypoints.openai.api_server",
+            "--model",
+            str(args.server_model_path or args.model_path),
+            "--tokenizer",
+            str(args.tokenizer_path or args.model_path),
+            "--served-model-name",
+            args.served_model_name,
+            "--trust-remote-code",
+            "--host",
+            args.host,
+            "--port",
+            str(args.port),
+            "--tensor-parallel-size",
+            "1",
+            "--dtype",
+            args.dtype,
+            "--max-model-len",
+            str(args.context_length),
+            "--gpu-memory-utilization",
+            str(args.mem_fraction_static),
+            "--enforce-eager",
+        ]
+        if args.dllm_algorithm == "AR":
+            # Serve the diffusion checkpoint as a plain causal LM via the AR
+            # model class (is_diffusion -> False, standard causal decode).
+            cmd += [
+                "--hf-overrides",
+                '{"architectures": ["NemotronLabsDiffusionForCausalLM"]}',
+            ]
+        elif args.dllm_algorithm == "FastDiffuser":
+            # Diffusion decode: load the block-diffusion model class (no arch
+            # override) and pass the decode policy as the engine diffusion_config.
+            # Map SGLang selection_policy naming to vLLM names.
+            vllm_selection = {"confidence": "confidence_threshold"}.get(
+                args.selection_policy, args.selection_policy
+            )
+            diffusion_config: dict[str, Any] = {
+                "selection_policy": vllm_selection,
+                "canvas_length": args.block_size,
+                "max_denoising_steps": args.max_steps,
+                "temperature": args.temperature,
+            }
+            if vllm_selection == "confidence_threshold":
+                diffusion_config["confidence_threshold"] = args.threshold
+            cmd += ["--diffusion-config", json.dumps(diffusion_config)]
+        else:
+            raise ValueError(
+                "vLLM backend supports --dllm-algorithm AR or FastDiffuser, "
+                f"got {args.dllm_algorithm}"
+            )
+        if args.server_random_seed is not None:
+            cmd.extend(["--seed", str(args.server_random_seed)])
+        return cmd
     py = args.venv / "bin" / "python"
     cmd = [
         str(py),
@@ -302,16 +364,20 @@ def server_command(args: argparse.Namespace, dllm_config: Path | None) -> list[s
 
 
 def launch_server(args: argparse.Namespace, dllm_config: Path | None) -> subprocess.Popen:
-    check_sglang_commit(args.sglang_repo, args.sglang_commit)
     log_path = args.outdir / "server.log"
     env = os.environ.copy()
     env.setdefault("HF_HOME", "/lustre/fsw/portfolios/coreai/users/snorouzi/hf_home")
     env.setdefault("HF_HUB_OFFLINE", "1")
     env.setdefault("TRANSFORMERS_OFFLINE", "1")
-    env.setdefault("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK", "1")
-    env["PYTHONPATH"] = f"{args.sglang_repo}/python"
-    env["DLLM_TEMPERATURE"] = str(args.temperature)
-    env["SELECTION_POLICY"] = args.selection_policy
+    if args.backend == "vllm":
+        env["VLLM_USE_V1"] = "1"
+        env["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
+    else:
+        check_sglang_commit(args.sglang_repo, args.sglang_commit)
+        env.setdefault("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK", "1")
+        env["PYTHONPATH"] = f"{args.sglang_repo}/python"
+        env["DLLM_TEMPERATURE"] = str(args.temperature)
+        env["SELECTION_POLICY"] = args.selection_policy
     if args.cuda_visible_devices:
         env["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
 
@@ -328,7 +394,7 @@ def wait_for_server(base_url: str, proc: subprocess.Popen | None) -> None:
 
     for i in range(600):
         if proc is not None and proc.poll() is not None:
-            raise RuntimeError(f"SGLang server exited with code {proc.returncode}")
+            raise RuntimeError(f"Server exited with code {proc.returncode}")
         for path in ("/health_generate", "/health"):
             try:
                 if requests.get(base_url + path, timeout=5).status_code == 200:
@@ -337,7 +403,7 @@ def wait_for_server(base_url: str, proc: subprocess.Popen | None) -> None:
             except requests.RequestException:
                 pass
         time.sleep(1)
-    raise TimeoutError(f"SGLang server did not become ready at {base_url}")
+    raise TimeoutError(f"Server did not become ready at {base_url}")
 
 
 def update_weights_from_disk(base_url: str, model_path: Path) -> None:
@@ -427,11 +493,16 @@ def generate_one_chat_completions(
         "temperature": temperature,
         "top_p": top_p,
         "max_tokens": max_new_tokens,
-        "steps": args.max_steps,
-        "block_length": args.block_size,
-        "threshold": args.threshold,
-        "benchmark_name": benchmark_name,
     }
+    if args.backend != "vllm":
+        payload.update(
+            {
+                "steps": args.max_steps,
+                "block_length": args.block_size,
+                "threshold": args.threshold,
+                "benchmark_name": benchmark_name,
+            }
+        )
     resp = requests.post(
         base_url + "/v1/chat/completions",
         json=payload,
@@ -458,6 +529,8 @@ def main() -> None:
     args.benchmark = normalize_benchmark(args.benchmark)
     args.outdir.mkdir(parents=True, exist_ok=True)
     args.base_url = args.base_url.rstrip("/")
+    if args.backend == "vllm":
+        args.generation_api = "chat_completions"
 
     if not args.model_path.is_dir():
         raise FileNotFoundError(
@@ -469,7 +542,13 @@ def main() -> None:
 
     dllm_config = write_dllm_config(args)
     if dllm_config is None:
-        print("SGLang AR mode: json_model_override_args={\"ar_mode\": true}")
+        if args.backend == "vllm":
+            if args.dllm_algorithm == "AR":
+                print("vLLM AR mode: architectures override -> NemotronLabsDiffusionForCausalLM")
+            else:
+                print(f"vLLM diffusion mode: {args.dllm_algorithm}, diffusion_config from decode args")
+        else:
+            print("SGLang AR mode: json_model_override_args={\"ar_mode\": true}")
     else:
         print(f"DLLM config: {dllm_config}")
 
