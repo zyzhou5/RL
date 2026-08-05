@@ -1146,9 +1146,34 @@ class VllmAsyncGenerationWorker(BaseVllmGenerationWorker):
 
         return cast(list[str], list_of_worker_results)
 
-    async def prepare_refit_info_async(self, state_dict_info: dict[str, Any]) -> None:
+    async def prepare_refit_info_async(
+        self, state_dict_info: dict[str, Any], generation_group: Optional[str] = None
+    ) -> None:
         """Async version of prepare_refit_info."""
-        await self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        await self.llm.collective_rpc(
+            "prepare_refit_info", args=(state_dict_info, generation_group)
+        )
+
+    async def reconfigure_dllm_async(
+        self, overrides: Optional[dict[str, Any]] = None
+    ) -> Optional[dict[str, Any]]:
+        """Async version of reconfigure_dllm."""
+        if not overrides:
+            return None
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reconfigure_dllm_async can only be used with async_engine=True. "
+                "Use reconfigure_dllm instead."
+            )
+        result_or_coro = await self.llm.collective_rpc(
+            "reconfigure_dllm", args=(overrides,)
+        )
+        if asyncio.iscoroutine(result_or_coro):
+            results = await result_or_coro
+        else:
+            results = result_or_coro
+        # Every worker returns the same previous config; take the first.
+        return results[0] if results else None
 
     async def update_weights_via_ipc_zmq_async(
         self,

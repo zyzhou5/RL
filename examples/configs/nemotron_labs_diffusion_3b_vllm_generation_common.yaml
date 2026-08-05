@@ -1,0 +1,65 @@
+# Shared vLLM generation section for the Nemotron-Labs-Diffusion-3B runs.
+#
+# Not a standalone config: it carries no algorithm, data or topology, only the
+# vLLM diffusion engine setup that was previously copy-pasted identically into
+# every _vllm_* variant. Mix it in AFTER the algorithm parent so it wins the
+# backend swap, e.g.
+#
+#   defaults:
+#     - deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron.yaml
+#     - nemotron_labs_diffusion_3b_vllm_generation_common.yaml
+#
+# (multi-parent defaults merge left to right, later parents win, and the child
+# file wins over all of them -- see nemo_rl/utils/config.py.)
+#
+# Deliberately NOT here, because they differ per run: the rest of
+# diffusion_config (each algorithm picks its own selection policy, temperature
+# and output channels), colocated/cluster topology, async_grpo, validation
+# decode overrides, checkpointing and logger names. Also note the SGLang
+# parents' sglang_cfg / sglang_val_dllm_overrides stay in the merged config and
+# are inert once the backend is vllm.
+policy:
+  # Official HF release. The locally-relabeled checkpoint no longer loads in
+  # vLLM after the fork rename; the first run re-does HF->mcore conversion once.
+  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B-official"
+
+  logprob_estimation:
+    # vLLM samples x0 over the FULL vocab (SGLang FastDiffuser excludes MASK),
+    # so the Megatron recompute must normalize the same way.
+    exclude_mask_token_from_logits: false
+
+  generation:
+    backend: "vllm"
+    # vLLM runs skip_tokenizer_init, so EOS must be explicit (checkpoint
+    # eos_token_id).
+    stop_token_ids: [11]
+    stop_strings: null
+    vllm_cfg:
+      async_engine: false
+      precision: ${policy.precision}
+      kv_cache_dtype: "auto"
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.55
+      max_model_len: ${policy.max_total_sequence_length}
+      # The diffusion path is validated eager (TRITON_ATTN); keep compile off.
+      enforce_eager: True
+      use_deep_gemm: False
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      enable_vllm_metrics_logger: false
+      vllm_metrics_logger_interval: 0.5
+    vllm_kwargs:
+      attention_backend: "TRITON_ATTN"
+      max_num_seqs: 32
+      # flashinfer-cubin autotune corrupts the CUDA context at warm-up.
+      kernel_config:
+        enable_flashinfer_autotune: false
+      diffusion_config:
+        # Rollout block size, shared by every run here. It must match
+        # hf_config_overrides.block_size on the training side: the vLLM engine
+        # loads the HF checkpoint (block_size 32 on disk) independently of
+        # hf_config_overrides, so without this the rollout would block at 32
+        # against an estimator expecting 16 -- silently, not as an error.
+        canvas_length: 16

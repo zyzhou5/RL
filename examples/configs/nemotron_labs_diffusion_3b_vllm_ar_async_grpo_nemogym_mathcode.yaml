@@ -45,6 +45,10 @@ policy:
         num_nodes: 4                 # was 2
     vllm_kwargs:
       diffusion_config: null         # AR decoding; see note 1 above
+    # This run descends from the block-JustGRPO chain and would inherit its
+    # confidence-unmasking validation policy, but an AR engine has no diffusion
+    # sampler to reconfigure -- validation would raise on the first attempt.
+    vllm_val_dllm_overrides: null
 
 checkpointing:
   checkpoint_dir: "results/grpo-nd3b-vllm-ar-async-grpo-nemogym-mathcode"

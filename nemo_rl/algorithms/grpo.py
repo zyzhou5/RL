@@ -241,46 +241,157 @@ def _deep_update(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, A
     return base
 
 
-def _val_overrides_need_server_group(overrides: Optional[dict[str, Any]]) -> bool:
-    """True when sglang_val_dllm_overrides asks for a dedicated validation engine.
+# Per-backend naming for the dedicated validation generation group. Each entry
+# gives the config key holding the validation overrides, the engine-config key
+# whose presence in those overrides means validation needs a structurally
+# different engine, and the Ray actor name prefix for the second group (the
+# rollout group owns the backend default prefix).
+_VAL_GROUP_BACKENDS: dict[str, dict[str, str]] = {
+    "sglang": {
+        "overrides_key": "sglang_val_dllm_overrides",
+        "engine_cfg_key": "sglang_cfg",
+        "name_prefix": "sglang_val",
+    },
+    "vllm": {
+        "overrides_key": "vllm_val_dllm_overrides",
+        "engine_cfg_key": "vllm_cfg",
+        "name_prefix": "vllm_val",
+    },
+}
+
+
+def _val_group_spec(backend: str) -> Optional[dict[str, str]]:
+    """Validation-group naming for `backend`, or None if it has no such support.
+
+    Configs commonly inherit the other backend's `*_val_dllm_overrides` key from
+    a shared parent; those are inert rather than an error, so this returns None
+    (and callers ignore the foreign key) instead of asserting.
+    """
+    return _VAL_GROUP_BACKENDS.get(backend)
+
+
+def _val_overrides_need_server_group(
+    overrides: Optional[dict[str, Any]], backend: str
+) -> bool:
+    """True when the validation overrides ask for a dedicated validation engine.
 
     Soft decode knobs (selection_policy/threshold/...) are handled at runtime
-    via reconfigure_dllm on the shared servers; an `sglang_cfg` key means the
-    validation engine differs structurally (fixed at server launch) and needs
-    its own server group.
+    via reconfigure_dllm on the shared engines; the backend's engine-config key
+    (`sglang_cfg` / `vllm_cfg`) means the validation engine differs structurally
+    (fixed at engine launch) and needs its own group.
     """
-    return bool(overrides) and "sglang_cfg" in overrides
+    spec = _val_group_spec(backend)
+    if spec is None:
+        return False
+    return bool(overrides) and spec["engine_cfg_key"] in overrides
+
+
+def _assert_val_group_shares_memory(
+    backend: str,
+    rollout_config: "SGLangConfig | VllmConfig",
+    val_config: "SGLangConfig | VllmConfig",
+    overrides: dict[str, Any],
+) -> None:
+    """Fail fast unless both engine groups are set up to time-share GPU memory.
+
+    The two groups are colocated on the same GPUs and only one is awake at a
+    time -- the validation group sleeps except around validation -- but each
+    backend expresses that differently, and they are checked against different
+    configs on purpose. SGLang's enable_memory_saver is a capability flag that
+    the validation group is meant to INHERIT from the rollout group, so it is
+    checked on the merged config. vLLM's gpu_memory_utilization is a budget
+    split between the two groups, so inheriting it is the mistake, and it is
+    checked on the raw overrides.
+    """
+    overrides_key = _VAL_GROUP_BACKENDS[backend]["overrides_key"]
+    if backend == "sglang":
+        for group, cfg in (("rollout", rollout_config), ("validation", val_config)):
+            assert cfg["sglang_cfg"].get("enable_memory_saver", False), (
+                f"{overrides_key} with sglang_cfg (dedicated validation server "
+                f"group) requires enable_memory_saver=true on the {group} server "
+                "group's sglang_cfg: the two groups time-share GPU memory (each "
+                "sleeps while the other generates)."
+            )
+    else:
+        # vLLM engines are always built with enable_sleep_mode=True, so the
+        # time-share works without an opt-in. What it does need is a deliberate
+        # memory split: inheriting the rollout group's gpu_memory_utilization is
+        # usually wrong, since both groups profile against the same device.
+        assert "gpu_memory_utilization" in overrides.get("vllm_cfg", {}), (
+            f"{overrides_key} with vllm_cfg (dedicated validation engine group) "
+            "requires an explicit vllm_cfg.gpu_memory_utilization in the "
+            "overrides: the two groups time-share GPU memory (each sleeps while "
+            "the other generates), so the validation group's budget must be a "
+            "deliberate choice rather than inherited from the rollout group."
+        )
 
 
 def _build_val_generation_config(
-    generation_config: "SGLangConfig",
-) -> Optional["SGLangConfig"]:
-    """Build the config for the validation-only SGLang server group.
+    generation_config: "SGLangConfig | VllmConfig",
+) -> Optional["SGLangConfig | VllmConfig"]:
+    """Build the config for the validation-only generation engine group.
 
     Starts from a deep copy of the rollout generation config and applies the
-    `sglang_val_dllm_overrides` overrides on top, so configs only need to state
-    what differs for validation (e.g. dllm_algorithm / json_model_override_args).
-    Returns None when no validation server group is requested (absent overrides
+    backend's `*_val_dllm_overrides` on top, so configs only need to state what
+    differs for validation (e.g. SGLang dllm_algorithm, or a vLLM
+    diffusion_config to validate with diffusion decoding under AR rollouts).
+    Returns None when no validation engine group is requested (absent overrides
     or soft-knob-only overrides, which use the runtime reconfigure path).
     """
-    overrides = generation_config.get("sglang_val_dllm_overrides")
-    if not _val_overrides_need_server_group(overrides):
+    backend = generation_config["backend"]
+    spec = _val_group_spec(backend)
+    if spec is None:
+        return None
+    overrides = generation_config.get(spec["overrides_key"])
+    if not _val_overrides_need_server_group(overrides, backend):
         return None
     val_config = copy.deepcopy(generation_config)
     # The validation group's decode policy is pinned by its own launch config:
     # it must not recurse into another validation group or trigger the
     # validation-time reconfigure hook on itself.
-    val_config["sglang_val_dllm_overrides"] = None
+    val_config[spec["overrides_key"]] = None
     _deep_update(val_config, copy.deepcopy(overrides))
 
-    for group, cfg in (("rollout", generation_config), ("validation", val_config)):
-        assert cfg["sglang_cfg"].get("enable_memory_saver", False), (
-            f"sglang_val_dllm_overrides with sglang_cfg (dedicated validation server "
-            f"group) requires enable_memory_saver=true on the {group} server group's "
-            "sglang_cfg: the two groups time-share GPU memory (each sleeps while the "
-            "other generates)."
-        )
+    _assert_val_group_shares_memory(
+        backend, generation_config, val_config, overrides
+    )
     return val_config
+
+
+def _maybe_init_val_generation_group(
+    generation_config: "SGLangConfig | VllmConfig",
+    inference_cluster: RayVirtualCluster,
+    worker_init_timing_metrics: dict[str, Any],
+) -> Optional[GenerationInterface]:
+    """Launch the validation-only generation engine group, if one is requested.
+
+    Started before the rollout group while GPU memory is still clean, then put
+    to sleep so the rollout engines and the policy can initialize as usual. It
+    is woken up (and refit with the current weights) only around validation.
+    """
+    val_generation_config = _build_val_generation_config(generation_config)
+    if val_generation_config is None:
+        return None
+
+    backend = generation_config["backend"]
+    spec = _VAL_GROUP_BACKENDS[backend]
+    generation_cls = SGLangGeneration if backend == "sglang" else VllmGeneration
+    print(
+        f"  ▶ Initializing validation {backend} engine group "
+        f"(overrides: {generation_config[spec['overrides_key']]})...",
+        flush=True,
+    )
+    t0 = time.perf_counter()
+    val_policy_generation = generation_cls(
+        cluster=inference_cluster,
+        config=val_generation_config,
+        # Ray named actors must be unique; the rollout group owns the backend's
+        # default name prefix.
+        name_prefix=spec["name_prefix"],
+    )
+    val_policy_generation.finish_generation()
+    worker_init_timing_metrics[f"{backend}_val_init_time_s"] = time.perf_counter() - t0
+    return val_policy_generation
 
 
 def setup(
@@ -478,28 +589,32 @@ def setup(
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
 
-    # sglang_val_dllm_overrides containing an sglang_cfg key requests a second
-    # SGLang server group used only for validation (e.g. AR rollouts +
-    # diffusion validation: the engine mode is fixed at server launch, so
-    # decoding under a structurally different engine needs its own servers).
+    # `<backend>_val_dllm_overrides` containing that backend's engine-config key
+    # requests a second generation engine group used only for validation (e.g.
+    # AR rollouts + diffusion validation: the engine mode is fixed at launch, so
+    # decoding under a structurally different engine needs its own group).
     # Validated up front so misconfigurations fail before any cluster/worker
     # setup. Soft-knob-only overrides keep the legacy runtime reconfigure path.
-    val_needs_server_group = _val_overrides_need_server_group(
-        generation_config.get("sglang_val_dllm_overrides")
+    val_group_spec = _val_group_spec(generation_config["backend"])
+    val_needs_server_group = val_group_spec is not None and (
+        _val_overrides_need_server_group(
+            generation_config.get(val_group_spec["overrides_key"]),
+            generation_config["backend"],
+        )
     )
     if val_needs_server_group:
-        assert generation_config["backend"] == "sglang", (
-            "sglang_val_dllm_overrides with sglang_cfg is only supported with the "
-            f"sglang generation backend, but got backend={generation_config['backend']}."
+        assert val_group_spec is not None  # narrowed by val_needs_server_group
+        val_group_desc = (
+            f"{val_group_spec['overrides_key']} with "
+            f"{val_group_spec['engine_cfg_key']} (dedicated validation engine group)"
         )
         assert colocated_inference, (
-            "sglang_val_dllm_overrides with sglang_cfg (dedicated validation server "
-            "group) requires colocated inference: the validation servers share GPUs "
-            "with training and time-share memory via the SGLang memory saver."
+            f"{val_group_desc} requires colocated inference: the validation "
+            "engines share GPUs with training and time-share GPU memory (each "
+            "group sleeps while the other generates)."
         )
         assert not grpo_config.get("async_grpo", {}).get("enabled", False), (
-            "sglang_val_dllm_overrides with sglang_cfg (dedicated validation server "
-            "group) is not supported with async GRPO."
+            f"{val_group_desc} is not supported with async GRPO."
         )
 
     env_name_list = extract_necessary_env_names(data_config)
@@ -762,7 +877,8 @@ def setup(
         return policy_generation, policy
 
     # Handle generation-specific setup
-    val_policy_generation = None  # set only when val overrides carry sglang_cfg
+    # Set only when the backend's val overrides carry its engine-config key.
+    val_policy_generation = None
     if backend == "megatron":
         # Megatron generation: policy_generation is None, only initialize policy
         policy_generation = None
@@ -803,6 +919,16 @@ def setup(
             "hf_config_overrides", {}
         )
 
+        # Optionally launch the validation-only engine group first, while GPU
+        # memory is still clean, then put it to sleep so the rollout engines and
+        # the policy can initialize as usual. Built after hf_overrides is set so
+        # the validation group inherits it -- and can still override it, since
+        # the validation overrides deep-merge last (a diffusion validation
+        # engine may want a different block_size than the training policy).
+        val_policy_generation = _maybe_init_val_generation_group(
+            generation_config, inference_cluster, worker_init_timing_metrics
+        )
+
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_vllm,
             generation_name="vLLM",
@@ -827,25 +953,9 @@ def setup(
         # memory is still clean, then put it to sleep (memory saver) so the
         # rollout servers and the policy can initialize as usual. It is woken
         # up (and refit with current weights) only around validation.
-        val_generation_config = _build_val_generation_config(generation_config)
-        if val_generation_config is not None:
-            print(
-                "  ▶ Initializing validation SGLang server group "
-                f"(dllm_algorithm={val_generation_config['sglang_cfg'].get('dllm_algorithm')})...",
-                flush=True,
-            )
-            t0 = time.perf_counter()
-            val_policy_generation = SGLangGeneration(
-                cluster=inference_cluster,
-                config=val_generation_config,
-                # Ray named actors must be unique; the rollout group owns the
-                # default "sglang_policy" prefix.
-                name_prefix="sglang_val",
-            )
-            val_policy_generation.finish_generation()
-            worker_init_timing_metrics["sglang_val_init_time_s"] = (
-                time.perf_counter() - t0
-            )
+        val_policy_generation = _maybe_init_val_generation_group(
+            generation_config, inference_cluster, worker_init_timing_metrics
+        )
 
         policy_generation, policy = initialize_generation_with_policy(
             init_generation_fn=init_sglang,
@@ -1300,8 +1410,12 @@ def refit_policy_generation(
                 update_success = True
             else:
                 # Original ZMQ IPC path for vLLM
+                # Namespaced per engine group: with a dedicated validation
+                # group there are two sets of inference workers on the same GPU,
+                # and they must not share refit sockets (see get_zmq_address).
                 futures_train = policy.stream_weights_via_ipc_zmq(
-                    buffer_size_bytes=buffer_size_bytes
+                    buffer_size_bytes=buffer_size_bytes,
+                    generation_group=getattr(policy_generation, "name_prefix", None),
                 )
                 futures_inference = policy_generation.update_weights_via_ipc_zmq()
                 # wait for all futures to complete
@@ -2687,22 +2801,26 @@ def validate(
         )
         # Optionally switch the generation engine to a fixed decoding policy for
         # validation so val curves are comparable across runs that roll out with
-        # different policies (e.g. leftmost vs confidence). Only affects the
-        # SGLang FastDiffuser backend; a no-op otherwise. Restored in `finally`.
+        # different policies (e.g. leftmost vs confidence). Supported by the
+        # SGLang FastDiffuser backend and by vLLM diffusion engines; a no-op
+        # otherwise (GenerationInterface.reconfigure_dllm defaults to None).
+        # Restored in `finally`.
         gen_cfg = (
             generation_config
             if generation_config is not None
             else master_config["policy"]["generation"]
         )
-        val_dllm_overrides = gen_cfg.get("sglang_val_dllm_overrides")
+        val_backend = gen_cfg.get("backend")
+        val_spec = _val_group_spec(val_backend)
+        val_dllm_overrides = (
+            gen_cfg.get(val_spec["overrides_key"]) if val_spec is not None else None
+        )
         restore_dllm_overrides = None
-        # Overrides containing sglang_cfg describe a dedicated validation
-        # server group (already launched with them baked in), not runtime
-        # decode knobs — never feed them to reconfigure_dllm.
-        if (
-            val_dllm_overrides
-            and not _val_overrides_need_server_group(val_dllm_overrides)
-            and gen_cfg.get("backend") == "sglang"
+        # Overrides carrying the backend's engine-config key describe a dedicated
+        # validation engine group (already launched with them baked in), not
+        # runtime decode knobs — never feed those to reconfigure_dllm.
+        if val_dllm_overrides and not _val_overrides_need_server_group(
+            val_dllm_overrides, val_backend
         ):
             restore_dllm_overrides = policy_generation.reconfigure_dllm(
                 val_dllm_overrides
@@ -2723,14 +2841,19 @@ def validate(
                 # Use async rollouts if vLLM async engine is enabled
                 # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
                 if _should_use_nemo_gym(master_config):
-                    generation_config = master_config["policy"]["generation"]
+                    # `gen_cfg`, not the rollout config: with a dedicated
+                    # validation engine group the sampling params sent to the
+                    # Gym servers must describe THAT engine. A diffusion
+                    # validation engine rejects any per-request temperature
+                    # other than 0 or 1, so an AR rollout temperature leaking
+                    # in here would fail every validation request.
                     nemo_gym_rollout_result = run_async_nemo_gym_rollout(
                         policy_generation=policy_generation,
                         input_batch=val_batch,
                         tokenizer=tokenizer,
                         task_to_env=val_task_to_env,
                         max_seq_len=None,
-                        generation_config=generation_config,
+                        generation_config=gen_cfg,
                         max_rollout_turns=None,
                         greedy=False,
                     )
@@ -2947,6 +3070,30 @@ def async_grpo_train(
         "Colocated inference is not supported for async GRPO. Please use non-colocated inference."
     )
 
+    # Runtime decode-knob overrides mutate state shared by every request on the
+    # engine, so rollouts have to be genuinely idle before validation switches
+    # them -- `pause` alone only gates NEW collection, and a rollout caught
+    # mid-flight would have part of its trajectory decoded under the validation
+    # policy, which the importance-sampling correction cannot account for.
+    _async_gen_cfg = master_config["policy"]["generation"]
+    _async_val_spec = _val_group_spec(_async_gen_cfg.get("backend"))
+    _async_val_overrides = (
+        _async_gen_cfg.get(_async_val_spec["overrides_key"])
+        if _async_val_spec is not None
+        else None
+    )
+    val_reconfigures_engine = bool(_async_val_overrides) and not (
+        _val_overrides_need_server_group(
+            _async_val_overrides, _async_gen_cfg.get("backend")
+        )
+    )
+    if val_reconfigures_engine:
+        print(
+            "  \u21aa Validation reconfigures the live decode policy; trajectory "
+            "collection will be drained (not just paused) around each validation.",
+            flush=True,
+        )
+
     # Calculate minimum buffer size from training requirements
     # In per-prompt buffer mode, one buffer entry is 1 prompt * num_generations_per_prompt
     num_prompts_per_step = master_config["grpo"]["num_prompts_per_step"]
@@ -3079,7 +3226,10 @@ def async_grpo_train(
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
         # Pause trajectory collection during initial validation
-        trajectory_collector.pause.remote()
+        if val_reconfigures_engine:
+            ray.get(trajectory_collector.pause_and_drain.remote())
+        else:
+            trajectory_collector.pause.remote()
 
         try:
             val_metrics, validation_timings = validate(
@@ -3482,7 +3632,10 @@ def async_grpo_train(
                     val_at_end and is_last_step
                 ):
                     # Pause trajectory collection during validation to reduce memory pressure
-                    trajectory_collector.pause.remote()
+                    if val_reconfigures_engine:
+                        ray.get(trajectory_collector.pause_and_drain.remote())
+                    else:
+                        trajectory_collector.pause.remote()
 
                     if NEED_REFIT and (
                         POLICY_GENERATION_STALE

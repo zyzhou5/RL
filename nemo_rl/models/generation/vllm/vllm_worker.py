@@ -984,9 +984,28 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         )
         return cast(list[str], list_of_worker_results)
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any], generation_group: Optional[str] = None
+    ) -> None:
         """Prepare the info for refit."""
-        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+        self.llm.collective_rpc(
+            "prepare_refit_info", args=(state_dict_info, generation_group)
+        )
+
+    def reconfigure_dllm(
+        self, overrides: Optional[dict[str, Any]] = None
+    ) -> Optional[dict[str, Any]]:
+        """Reconfigure live diffusion decode knobs on this engine's workers."""
+        if not overrides:
+            return None
+        if self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "reconfigure_dllm cannot be used with async_engine=True. Use "
+                "reconfigure_dllm_async instead."
+            )
+        results = self.llm.collective_rpc("reconfigure_dllm", args=(overrides,))
+        # Every worker returns the same previous config; take the first.
+        return results[0] if results else None
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:

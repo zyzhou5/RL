@@ -44,3 +44,34 @@ class VllmSpecificArgs(TypedDict):
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Optional overrides describing how VALIDATION decoding differs from
+    # rollout decoding. Must contain a "vllm_cfg" key: unlike SGLang, vLLM has
+    # no runtime decode-reconfigure path, since the diffusion knobs are copied
+    # into the sampler when the model loads. The dict is deep-merged on top of
+    # a copy of this generation config and a SECOND vLLM engine group is
+    # launched from it, used only for validation, e.g. AR rollouts with
+    # diffusion validation:
+    #   vllm_val_dllm_overrides:
+    #     temperature: 1.0
+    #     vllm_cfg:
+    #       gpu_memory_utilization: 0.7
+    #     vllm_kwargs:
+    #       diffusion_config:
+    #         canvas_length: 32
+    #         selection_policy: "confidence_threshold"
+    #         confidence_threshold: 0.9
+    #         temperature: 1.0
+    # Note that a diffusion validation group needs `temperature` and
+    # `vllm_kwargs.diffusion_config.temperature` to agree numerically: the
+    # engine samples at the diffusion_config value while the trainer tempers by
+    # generation.temperature, and the worker rejects a mismatch (see
+    # vllm_worker.py `_build_sampling_params`).
+    #
+    # Requires colocated inference and synchronous GRPO. The two groups
+    # time-share GPU memory -- vLLM engines are always built with
+    # enable_sleep_mode, and the validation group sleeps except around
+    # validation -- so vllm_cfg.gpu_memory_utilization must be stated
+    # explicitly here rather than inherited from the rollout group.
+    #
+    # Absent/None => validation uses the same decoding as rollout.
+    vllm_val_dllm_overrides: NotRequired[dict[str, Any] | None]

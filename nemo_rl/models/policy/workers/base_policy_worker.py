@@ -71,23 +71,35 @@ class AbstractPolicyWorker:
         # Get device UUID using NVML
         return get_device_uuid(device_idx)
 
-    def get_zmq_address(self) -> str:
-        """Get the ZMQ address for the current device."""
-        return f"ipc:///tmp/{self.report_device_id()}.sock"
+    def get_zmq_address(self, generation_group: Optional[str] = None) -> str:
+        """Get the ZMQ address for the current device.
 
-    def maybe_init_zmq(self) -> None:
-        """Initialize the ZMQ socket if it doesn't exist."""
-        if not hasattr(self, "zmq_socket"):
+        `generation_group` namespaces the socket per generation engine group.
+        A run with a dedicated validation engine group has two sets of
+        inference workers on the same GPU, and this side BINDS a REQ socket:
+        with two connected REP peers ZMQ load-balances requests across them, so
+        each engine would silently receive only part of every weight update.
+        None keeps the legacy single-group address.
+        """
+        device_id = self.report_device_id()
+        if generation_group:
+            return f"ipc:///tmp/{generation_group}-{device_id}.sock"
+        return f"ipc:///tmp/{device_id}.sock"
+
+    def maybe_init_zmq(self, generation_group: Optional[str] = None) -> Any:
+        """Return this group's ZMQ socket, creating and binding it on first use."""
+        if not hasattr(self, "zmq_context"):
             self.zmq_context = zmq.Context()
-            self.zmq_socket = self.zmq_context.socket(zmq.REQ)
-            self.zmq_socket.setsockopt(
-                zmq.SNDTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(
-                zmq.RCVTIMEO, 120000
-            )  # set timeout to 120 seconds
-            self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.bind(self.get_zmq_address())
+            self.zmq_sockets: dict[Optional[str], Any] = {}
+        socket = self.zmq_sockets.get(generation_group)
+        if socket is None:
+            socket = self.zmq_context.socket(zmq.REQ)
+            socket.setsockopt(zmq.SNDTIMEO, 120000)  # set timeout to 120 seconds
+            socket.setsockopt(zmq.RCVTIMEO, 120000)  # set timeout to 120 seconds
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.bind(self.get_zmq_address(generation_group))
+            self.zmq_sockets[generation_group] = socket
+        return socket
 
     def get_free_memory_bytes(self) -> int:
         """Get the available free memory."""
@@ -100,8 +112,9 @@ class AbstractPolicyWorker:
         """Shutdown the policy."""
         try:
             # Clean up extension resources like ZMQ sockets
-            if hasattr(self, "zmq_socket"):
-                self.zmq_socket.close()
+            if hasattr(self, "zmq_context"):
+                for socket in self.zmq_sockets.values():
+                    socket.close()
                 self.zmq_context.term()
             return True
         except Exception:

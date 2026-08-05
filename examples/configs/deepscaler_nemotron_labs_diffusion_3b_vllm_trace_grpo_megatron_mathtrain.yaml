@@ -1,0 +1,59 @@
+# TraceGRPO on Nemotron-Labs-Diffusion-3B, MATH (Hendrycks) train split, vLLM
+# generation. FULL run (non-toy sibling of ..._mathtrain_toy_8p8g.yaml).
+#
+# Backend swap of the DeepScaleR SGLang trace config: inherits the full-scale
+# trainer side (16 nodes, 128 prompts x 8 gen, train_global_batch_size 1024,
+# max_num_steps 5000, val_period 10, checkpointing on, trace estimator,
+# block_size 16, math env / hf verify reward, cot.txt, seq 4096 / max_new
+# 3744). The vLLM engine section comes from the shared generation mixin, listed
+# second so it overrides the SGLang parent's backend; this file adds only the
+# trace decode channels and the MATH train split.
+#
+# NOTE it inherits the SGLang TRACE parent, not the block-JustGRPO one -- the
+# trace estimator and loss come from there, and only the generation section is
+# shared with the block runs.
+#
+# Requires the reveal-steps vLLM runtime:
+#   NRL_VLLM_PY_EXECUTABLE=/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_reveal_steps/bin/python-compat
+# Submit with NODES=16 (matches the inherited cluster.num_nodes: 16).
+defaults:
+  - "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron.yaml"
+  - "nemotron_labs_diffusion_3b_vllm_generation_common.yaml"
+
+policy:
+  generation:
+    vllm_kwargs:
+      diffusion_config:
+        temperature: 1.0
+        selection_policy: "confidence_threshold"
+        confidence_threshold: 0.9
+        return_reveal_steps: true
+
+    # Fixed validation decode policy, so val curves are comparable across runs
+    # that roll out with different policies (leftmost / random / confidence) and
+    # against the SGLang runs, whose sglang_val_dllm_overrides use the same
+    # confidence-0.9 protocol. Applied by reconfigure_dllm on the live rollout
+    # engines at validation and restored afterwards (no vllm_cfg key => no
+    # second engine group), so it works colocated or not, and under async GRPO.
+    #
+    # Block size is absent on purpose: canvas_length is consumed when the engine
+    # loads, so validation runs at the rollout canvas (16 here). Validating at a
+    # different block size needs a dedicated engine group -- add a vllm_cfg key.
+    vllm_val_dllm_overrides:
+      vllm_kwargs:
+        diffusion_config:
+          selection_policy: "confidence_threshold"
+          confidence_threshold: 0.9
+          temperature: 1.0
+
+data:
+  train:
+    dataset_name: MATH
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-mathtrain-megatron-vllm"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-mathtrain-vllm"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-mathtrain-megatron-vllm"

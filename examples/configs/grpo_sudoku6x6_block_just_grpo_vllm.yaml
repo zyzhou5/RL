@@ -1,65 +1,44 @@
 # Block JustGRPO on Nemotron-Labs-Diffusion-3B, 6x6 Sudoku, vLLM generation.
 #
-# Backend-swap child of grpo_sudoku6x6_block_just_grpo.yaml: trainer side
+# Backend-swap child of grpo_sudoku6x6_block_just_grpo.yaml: the trainer side
 # (block worker, block-reveal estimator at block 16, sudoku prompts/rewards,
-# seq 1536 / max_new_tokens 512 / mbs 8, 8 nodes) is inherited; only the
-# generation section changes. Inherited sglang_cfg / sglang_val_dllm_overrides
-# are inert with backend "vllm". See the GSM8K vLLM variant
-# (gsm8k_nemotron_labs_diffusion_3b_vllm_block_just_grpo_megatron.yaml) for
-# the rationale behind each override; the two generation sections are kept
-# identical apart from the interpolated max_model_len.
+# seq 1536 / max_new_tokens 512 / mbs 8, 8 nodes) is inherited, and the vLLM
+# engine section comes from the shared generation mixin, listed second so it
+# overrides the SGLang parent's backend. Inherited sglang_cfg /
+# sglang_val_dllm_overrides are inert with backend "vllm".
 #
 # Requires the custom vLLM runtime:
 #   NRL_VLLM_PY_EXECUTABLE=<vllm-runtime-venv>/bin/python-compat
-defaults: "grpo_sudoku6x6_block_just_grpo.yaml"
+defaults:
+  - "grpo_sudoku6x6_block_just_grpo.yaml"
+  - "nemotron_labs_diffusion_3b_vllm_generation_common.yaml"
 
 policy:
-  # Official HF release (NemotronLabsDiffusionModel / nemotron_labs_diffusion).
-  # The locally-relabeled checkpoint (MinistralDiffEncoderModel) no longer
-  # loads in vLLM after fork commit efe3070be. NOTE: first training run with
-  # this path re-runs the one-time HF->mcore conversion under a new cache.
-  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B-official"
-  logprob_estimation:
-    # vLLM samples x0 over the FULL vocab (FastDiffuser excludes MASK); the
-    # Megatron recompute must normalize the same way.
-    exclude_mask_token_from_logits: false
-
   generation:
-    backend: "vllm"
-    # vLLM runs skip_tokenizer_init -> EOS must be explicit (checkpoint
-    # eos_token_id).
-    stop_token_ids: [11]
-    stop_strings: null
-    vllm_cfg:
-      async_engine: false
-      precision: ${policy.precision}
-      kv_cache_dtype: "auto"
-      tensor_parallel_size: 1
-      pipeline_parallel_size: 1
-      expert_parallel_size: 1
-      gpu_memory_utilization: 0.55
-      max_model_len: ${policy.max_total_sequence_length}
-      # The diffusion path is validated eager (TRITON_ATTN); keep compile off.
-      enforce_eager: True
-      use_deep_gemm: False
-      num_last_layers_in_bf16: 0
-      num_first_layers_in_bf16: 0
-      enable_vllm_metrics_logger: false
-      vllm_metrics_logger_interval: 0.5
     vllm_kwargs:
-      attention_backend: "TRITON_ATTN"
-      max_num_seqs: 32
-      # flashinfer-cubin autotune corrupts the CUDA context at warm-up.
-      kernel_config:
-        enable_flashinfer_autotune: false
       # Leftmost reveal, 1 token/step (max_denoising_steps defaults to
-      # canvas), Gumbel sampling at T=1; greedy validation is per-request T=0.
-      # canvas_length must match hf_config_overrides.block_size (the engine
-      # loads the HF checkpoint, which says 32 on disk).
+      # canvas), Gumbel sampling at T=1. canvas_length comes from the
+      # generation mixin.
       diffusion_config:
         temperature: 1.0
         selection_policy: "leftmost"
-        canvas_length: 16
+
+    # Fixed validation decode policy, so val curves are comparable across runs
+    # that roll out with different policies (leftmost / random / confidence) and
+    # against the SGLang runs, whose sglang_val_dllm_overrides use the same
+    # confidence-0.9 protocol. Applied by reconfigure_dllm on the live rollout
+    # engines at validation and restored afterwards (no vllm_cfg key => no
+    # second engine group), so it works colocated or not, and under async GRPO.
+    #
+    # Block size is absent on purpose: canvas_length is consumed when the engine
+    # loads, so validation runs at the rollout canvas (16 here). Validating at a
+    # different block size needs a dedicated engine group -- add a vllm_cfg key.
+    vllm_val_dllm_overrides:
+      vllm_kwargs:
+        diffusion_config:
+          selection_policy: "confidence_threshold"
+          confidence_threshold: 0.9
+          temperature: 1.0
 
 checkpointing:
   checkpoint_dir: "results/grpo-nd3b-block_just_grpo-sudoku6x6-megatron-vllm"

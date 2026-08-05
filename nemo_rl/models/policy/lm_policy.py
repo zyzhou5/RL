@@ -891,13 +891,28 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         return free_memory_bytes
 
     def stream_weights_via_ipc_zmq(
-        self, buffer_size_bytes: int, kv_scales: Optional[dict[str, float]] = None
+        self,
+        buffer_size_bytes: int,
+        kv_scales: Optional[dict[str, float]] = None,
+        generation_group: Optional[str] = None,
     ) -> list[ray.ObjectRef]:
-        """Send the weights for IPC handles via ZMQ socket."""
+        """Send the weights for IPC handles via ZMQ socket.
+
+        `generation_group` selects which generation engine group's sockets to
+        bind, so a dedicated validation engine group does not share the rollout
+        group's sockets. It must match what that group passed to
+        `prepare_refit_info`. Only the Megatron worker accepts it -- the DTensor
+        workers keep the legacy single-socket signature -- so it is passed only
+        when a group is actually named.
+        """
+        kwargs: dict[str, Any] = {
+            "buffer_size_bytes": buffer_size_bytes,
+            "kv_scales": kv_scales,
+        }
+        if generation_group is not None:
+            kwargs["generation_group"] = generation_group
         futures = self.worker_group.run_all_workers_single_data(
-            "stream_weights_via_ipc_zmq",
-            buffer_size_bytes=buffer_size_bytes,
-            kv_scales=kv_scales,
+            "stream_weights_via_ipc_zmq", **kwargs
         )
         return futures
 

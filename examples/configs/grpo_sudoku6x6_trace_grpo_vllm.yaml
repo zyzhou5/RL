@@ -5,9 +5,10 @@
 # side is inherited (TraceGRPOMegatronPolicyWorker, logprob_estimation.type
 # trace_grpo, hf_config_overrides.block_size 16, sudoku prompts/rewards,
 # seq 1536 / max_new_tokens 512 / mbs 8, 8 nodes, KL 0.01 k3, no reward
-# normalization); only the generation section changes. The inherited
-# sglang_cfg / sglang_val_dllm_overrides keys are inert with backend "vllm"
-# (grpo.py gates both on backend == "sglang").
+# normalization). The vLLM engine section comes from the shared generation
+# mixin, listed second so it overrides the SGLang parent's backend; the
+# inherited sglang_cfg / sglang_val_dllm_overrides keys are inert with backend
+# "vllm" (grpo.py resolves the validation-override key per backend).
 #
 # Reveal-step channel. Trace replays the decoding trajectory, so the rollout
 # must return each token's block-relative commit step. On SGLang that needs
@@ -33,73 +34,54 @@
 # step makes progress.
 #
 # Differences beyond the engine swap:
-#   - exclude_mask_token_from_logits false: the vLLM sampler draws x0 from a
-#     softmax over the FULL vocab (SGLang FastDiffuser excludes MASK), so the
-#     Megatron recompute must normalize the same way. The trace parent sets
-#     this true for SGLang.
+#   - exclude_mask_token_from_logits false (set in the generation mixin): the
+#     vLLM sampler draws x0 from a softmax over the FULL vocab (SGLang
+#     FastDiffuser excludes MASK), so the Megatron recompute must normalize the
+#     same way. The trace parent sets this true for SGLang.
 #   - canvas_length 16: the vLLM engine loads the HF checkpoint (block_size
 #     32 on disk) independently of hf_config_overrides, so this override is
 #     what keeps rollout blocking aligned with the trace estimator, which
 #     inherits the model block_size (16).
-#   - Validation decodes with the rollout policy instead of the SGLang
-#     confidence-0.9 overrides; there is no vLLM equivalent of
-#     sglang_val_dllm_overrides yet, so val curves are not directly
-#     comparable to the SGLang runs.
+#   - Validation decodes with the rollout policy. vllm_val_dllm_overrides can
+#     now pin a fixed validation decode policy (runtime reconfigure for decode
+#     knobs, or a dedicated engine group when vllm_cfg is present), but this
+#     config does not set one, so val curves are not directly comparable to the
+#     SGLang confidence-0.9 runs.
 #
 # Requires the custom vLLM runtime built from the fork branch carrying
 # DiffusionConfig.return_reveal_steps:
 #   NRL_VLLM_PY_EXECUTABLE=<vllm-runtime-venv>/bin/python-compat
-defaults: "grpo_sudoku6x6_trace_grpo.yaml"
+defaults:
+  - "grpo_sudoku6x6_trace_grpo.yaml"
+  - "nemotron_labs_diffusion_3b_vllm_generation_common.yaml"
 
 policy:
-  # Official HF release (NemotronLabsDiffusionModel / nemotron_labs_diffusion).
-  # The locally-relabeled checkpoint (MinistralDiffEncoderModel) does not load
-  # in the vLLM fork. NOTE: the first training run with this path re-runs the
-  # one-time HF->mcore conversion under a new cache.
-  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B-official"
-
-  logprob_estimation:
-    exclude_mask_token_from_logits: false
-
   generation:
-    backend: "vllm"
-    # vLLM runs skip_tokenizer_init on the training path, so EOS must be given
-    # explicitly (checkpoint eos_token_id). Without it every rollout runs to
-    # the context limit with post-EOS garbage in training sequences.
-    stop_token_ids: [11]
-    stop_strings: null
-    vllm_cfg:
-      async_engine: false
-      precision: ${policy.precision}
-      kv_cache_dtype: "auto"
-      tensor_parallel_size: 1
-      pipeline_parallel_size: 1
-      expert_parallel_size: 1
-      gpu_memory_utilization: 0.55
-      max_model_len: ${policy.max_total_sequence_length}
-      # The diffusion path is validated eager (TRITON_ATTN); keep compile off.
-      enforce_eager: True
-      use_deep_gemm: False
-      num_last_layers_in_bf16: 0
-      num_first_layers_in_bf16: 0
-      enable_vllm_metrics_logger: false
-      vllm_metrics_logger_interval: 0.5
     vllm_kwargs:
-      attention_backend: "TRITON_ATTN"
-      max_num_seqs: 32
-      # flashinfer-cubin autotune corrupts the CUDA context during engine
-      # warm-up on this stack (illegal memory access); the model can't use
-      # FlashInfer attention anyway.
-      kernel_config:
-        enable_flashinfer_autotune: false
       diffusion_config:
         temperature: 1.0
         selection_policy: "confidence_threshold"
         confidence_threshold: 0.9
-        canvas_length: 16
         # Emit each token's block-relative reveal step as
         # CompletionOutput.reveal_steps -- required by the trace estimator.
         return_reveal_steps: true
+
+    # Fixed validation decode policy, so val curves are comparable across runs
+    # that roll out with different policies (leftmost / random / confidence) and
+    # against the SGLang runs, whose sglang_val_dllm_overrides use the same
+    # confidence-0.9 protocol. Applied by reconfigure_dllm on the live rollout
+    # engines at validation and restored afterwards (no vllm_cfg key => no
+    # second engine group), so it works colocated or not, and under async GRPO.
+    #
+    # Block size is absent on purpose: canvas_length is consumed when the engine
+    # loads, so validation runs at the rollout canvas (16 here). Validating at a
+    # different block size needs a dedicated engine group -- add a vllm_cfg key.
+    vllm_val_dllm_overrides:
+      vllm_kwargs:
+        diffusion_config:
+          selection_policy: "confidence_threshold"
+          confidence_threshold: 0.9
+          temperature: 1.0
 
 checkpointing:
   checkpoint_dir: "results/grpo-nd3b-trace_grpo-sudoku6x6-megatron-vllm"

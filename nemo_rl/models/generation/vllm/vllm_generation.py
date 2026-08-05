@@ -54,6 +54,10 @@ class VllmGeneration(GenerationInterface):
         """Initialize a vLLM policy with distributed workers."""
         # Store config
         self.cfg = config
+        # Identifies this engine group. Beyond naming the Ray actors it
+        # namespaces the refit ZMQ sockets, so a second (validation-only) group
+        # colocated on the same GPUs does not share the rollout group's.
+        self.name_prefix = name_prefix
         self.tp_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pp_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.ep_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -816,11 +820,64 @@ class VllmGeneration(GenerationInterface):
         futures = self.worker_group.run_all_workers_single_data(
             method_name,
             state_dict_info=state_dict_info,
+            generation_group=self.name_prefix,
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
 
         # Wait for all futures to complete
         ray.get(futures)
+
+    def reconfigure_dllm(
+        self, overrides: Optional[dict[str, Any]]
+    ) -> Optional[dict[str, Any]]:
+        """Reconfigure live diffusion decode knobs on every engine in this group.
+
+        Takes and returns the nested `vllm_kwargs.diffusion_config` shape that
+        `vllm_val_dllm_overrides` uses, so the returned previous values can be
+        handed straight back to restore the rollout configuration.
+
+        Only knobs the sampler re-reads each denoising step can be changed this
+        way; see `VllmInternalWorkerExtension.reconfigure_dllm`. Structural
+        differences (canvas length, AR vs diffusion) need a separate engine
+        group. Callers must quiesce generation first -- the sampler is shared
+        engine state.
+        """
+        if not overrides:
+            return None
+        knobs = (overrides.get("vllm_kwargs") or {}).get("diffusion_config")
+        if not knobs:
+            return None
+
+        # Anything outside vllm_kwargs.diffusion_config is consumed when the
+        # engine is built, so silently ignoring it would leave validation
+        # decoding under settings the config says it changed (a top-level
+        # `temperature: 0.0` reading as greedy while sampling stays on the
+        # rollout schedule, say).
+        stray = sorted(set(overrides) - {"vllm_kwargs"}) + sorted(
+            f"vllm_kwargs.{k}" for k in set(overrides["vllm_kwargs"]) - {"diffusion_config"}
+        )
+        if stray:
+            raise ValueError(
+                f"Cannot apply {stray} to a live engine: only "
+                "vllm_kwargs.diffusion_config knobs are re-read during decoding. "
+                "Add a vllm_cfg key to these overrides to request a dedicated "
+                "validation engine group instead."
+            )
+
+        method_name = (
+            "reconfigure_dllm_async"
+            if self.cfg["vllm_cfg"]["async_engine"]
+            else "reconfigure_dllm"
+        )
+        futures = self.worker_group.run_all_workers_single_data(
+            method_name,
+            overrides=knobs,
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        results = [r for r in ray.get(futures) if r is not None]
+        if not results:
+            return None
+        return {"vllm_kwargs": {"diffusion_config": results[0]}}
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         """Update weights of the policy using IPC handles via ZMQ socket."""

@@ -1,31 +1,30 @@
 # BlockJustGRPO on DeepScaleR (AIME2024 val) with ASYNC vLLM generation and
 # FULL async-GRPO (overlapped rollout collection, trajectory staleness <= 1).
 #
-# Backend-swap + async overlay on the SGLang production config: the trainer
-# side (block worker, block-reveal estimator, hf_config_overrides.block_size
-# 16, seq 4096 / max_new_tokens 3744, mbs 2, DeepScaleR/AIME data) is
-# inherited; this file overrides generation and the async-GRPO knobs.
-# Pattern and rationale follow the validated sudoku pair
-# (grpo_sudoku6x6_block_just_grpo_vllm.yaml + _async_grpo.yaml); see
+# Async overlay on the SYNC vLLM config: the trainer side (block worker,
+# block-reveal estimator, hf_config_overrides.block_size 16, seq 4096 /
+# max_new_tokens 3744, mbs 2, DeepScaleR/AIME data) and the whole vLLM engine
+# section are inherited; this file only flips the engine to async, moves to a
+# non-colocated topology and turns on async-GRPO. See
 # plans/sglang_to_vllm_block_just_grpo.md.
 #
-# Topology: NON-colocated (async-GRPO hard requirement) — 16 training nodes
+# Topology: NON-colocated (async-GRPO hard requirement) -- 16 training nodes
 # (unchanged vs the sync SGLang config, keeps batch divisibility and
 # comparability) + 2 dedicated generation nodes. DeepScaleR rollouts are long
 # (3744 tokens, leftmost = 1 token/denoise-step), so generation needs more
-# dedicated capacity than sudoku (1 node); 2 is a starting point — check
+# dedicated capacity than sudoku (1 node); 2 is a starting point -- check
 # buffer_filled_ratio waits in early steps and add a node if the collector
 # cannot keep up with training cadence.
 #
 # Inherited-but-inert: sglang_cfg + sglang_val_dllm_overrides (backend gate).
 # Validation therefore decodes with the rollout policy at per-request greedy
-# T=0 instead of the SGLang confidence-0.9 protocol (known Phase-2 gap) —
+# T=0 instead of the SGLang confidence-0.9 protocol (known Phase-2 gap) --
 # val numbers are NOT directly comparable to SGLang deepscaler runs.
 #
 # Requires the custom vLLM runtime + the async-GRPO env recipe (nccl4py,
-# NCCL 2.28.9 aligned in trainer envs — see memory/plan doc):
+# NCCL 2.28.9 aligned in trainer envs -- see memory/plan doc):
 #   NRL_VLLM_PY_EXECUTABLE=<vllm-runtime-venv>/bin/python-compat
-defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron.yaml"
+defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_block_just_grpo_megatron.yaml"
 
 grpo:
   async_grpo:
@@ -38,21 +37,7 @@ loss_fn:
   use_importance_sampling_correction: true
 
 policy:
-  # Official HF release; the locally-relabeled checkpoint no longer loads in
-  # vLLM after the fork rename. First run re-does HF->mcore conversion once.
-  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-3B-official"
-
-  logprob_estimation:
-    # vLLM samples x0 over the FULL vocab (FastDiffuser excludes MASK); the
-    # Megatron recompute must normalize the same way.
-    exclude_mask_token_from_logits: false
-
   generation:
-    backend: "vllm"
-    # vLLM runs skip_tokenizer_init -> EOS must be explicit (checkpoint
-    # eos_token_id). max_new_tokens 3744 inherited (divisible by 16).
-    stop_token_ids: [11]
-    stop_strings: null
     colocated:
       enabled: false
       resources:
@@ -60,33 +45,6 @@ policy:
         num_nodes: 2   # dedicated generation nodes (see topology note)
     vllm_cfg:
       async_engine: true
-      precision: ${policy.precision}
-      kv_cache_dtype: "auto"
-      tensor_parallel_size: 1
-      pipeline_parallel_size: 1
-      expert_parallel_size: 1
-      gpu_memory_utilization: 0.55
-      max_model_len: ${policy.max_total_sequence_length}
-      # The diffusion path is validated eager (TRITON_ATTN); keep compile off.
-      enforce_eager: True
-      use_deep_gemm: False
-      num_last_layers_in_bf16: 0
-      num_first_layers_in_bf16: 0
-      enable_vllm_metrics_logger: false
-      vllm_metrics_logger_interval: 0.5
-    vllm_kwargs:
-      attention_backend: "TRITON_ATTN"
-      max_num_seqs: 32
-      # flashinfer-cubin autotune corrupts the CUDA context at warm-up.
-      kernel_config:
-        enable_flashinfer_autotune: false
-      # Leftmost reveal, 1 token/step (max_denoising_steps defaults to
-      # canvas), Gumbel sampling at T=1; greedy validation is per-request
-      # T=0. canvas_length must match hf_config_overrides.block_size.
-      diffusion_config:
-        temperature: 1.0
-        selection_policy: "leftmost"
-        canvas_length: 16
 
 cluster:
   num_nodes: 18   # 16 training + 2 generation

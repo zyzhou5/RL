@@ -552,6 +552,21 @@ class AsyncTrajectoryCollector:
         self._manual_pause_cleared.clear()  # Signal collection to pause
         print("Trajectory collection paused")
 
+    def pause_and_drain(self) -> None:
+        """Pause collection and block until in-flight generations have finished.
+
+        `pause` only gates NEW collection starts, so rollouts already running
+        keep decoding. Anything that mutates state shared by every request on
+        the engine -- switching the diffusion decode policy for validation --
+        has to wait for them: otherwise part of a training trajectory is
+        generated under the validation policy, and the importance-sampling
+        correction has no way to see it.
+
+        Unlike `pause`, call this with a blocking `ray.get`.
+        """
+        self.pause()
+        self.wait_for_pending_generations()
+
     def resume(self) -> None:
         """Resume trajectory collection."""
         self._manual_pause_cleared.set()  # Signal collection to resume

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import math
 import traceback
 from typing import Any
 
@@ -78,9 +79,19 @@ class VllmInternalWorkerExtension:
 
         return get_device_uuid(self.device.index)
 
-    def get_zmq_address(self):
-        """Get the ZMQ address for the current device."""
-        return f"ipc:///tmp/{self.report_device_id()}.sock"
+    def get_zmq_address(self, generation_group=None):
+        """Get the ZMQ address for the current device.
+
+        Mirrors `AbstractPolicyWorker.get_zmq_address`: the group name has to match
+        on both ends or the bind and the connect never rendezvous. It exists so
+        a dedicated validation engine group does not share the rollout group's
+        socket -- the policy side binds a REQ socket, and ZMQ would load-balance
+        the weight buffers across two connected REP peers.
+        """
+        device_id = self.report_device_id()
+        if generation_group:
+            return f"ipc:///tmp/{generation_group}-{device_id}.sock"
+        return f"ipc:///tmp/{device_id}.sock"
 
     def maybe_init_zmq(self):
         """Initialize the ZMQ socket if it doesn't exist."""
@@ -96,16 +107,117 @@ class VllmInternalWorkerExtension:
                 zmq.RCVTIMEO, 120000
             )  # set timeout to 120 seconds
             self.zmq_socket.setsockopt(zmq.LINGER, 0)
-            self.zmq_socket.connect(self.get_zmq_address())
+            self.zmq_socket.connect(
+                self.get_zmq_address(getattr(self, "generation_group", None))
+            )
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any], generation_group: str | None = None
+    ) -> None:
         """Prepare state dict metadata for weight refitting and IPC streaming.
 
         Args:
             state_dict_info (dict): A dictionary containing the info for refit.
                 e.g. {tensor_name: (shape, dtype)}
+            generation_group (str | None): Name of the generation engine group
+                this worker belongs to. Namespaces the refit ZMQ socket; must
+                match what the policy side streams to.
         """
+        self.generation_group = generation_group  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
         self.state_dict_info = state_dict_info  # pyrefly: ignore[implicitly-defined-attribute]  This class does not define __init__ so assignments like this should be ignored
+
+    # Diffusion decode knobs that can be changed on a live engine. DiffusionConfig
+    # is read when the model loads and copied into the model state, then into the
+    # sampler, so at runtime the SAMPLER is the source of truth -- mutating
+    # vllm_config here would be a silent no-op. Knobs missing from this list are
+    # fixed at engine construction: canvas_length sizes the preallocated canvas
+    # buffers and the speculative-token budget, and whether the model is a
+    # diffusion model at all is decided by the checkpoint architecture.
+    _RECONFIGURABLE_DLLM_KNOBS = (
+        "selection_policy",
+        "confidence_threshold",
+        "temperature",
+        "max_denoising_steps",
+    )
+
+    _DLLM_SELECTION_POLICIES = (
+        "low_confidence",
+        "leftmost",
+        "random",
+        "confidence_threshold",
+    )
+
+    @staticmethod
+    def _read_selection_policy(sampler: Any) -> str:
+        """Recover the policy name from the booleans the sampler keeps it as."""
+        if sampler.leftmost:
+            return "leftmost"
+        if sampler.random_mode:
+            return "random"
+        if sampler.threshold_mode:
+            return "confidence_threshold"
+        return "low_confidence"
+
+    def _write_selection_policy(self, sampler: Any, policy: str) -> None:
+        if policy not in self._DLLM_SELECTION_POLICIES:
+            raise ValueError(
+                f"Unknown diffusion selection_policy {policy!r}; expected one of "
+                f"{list(self._DLLM_SELECTION_POLICIES)}."
+            )
+        # The sampler stores the policy pre-derived as three mutually exclusive
+        # booleans, so all three are rewritten together -- setting only one would
+        # leave the engine in a state the loader could never produce.
+        sampler.leftmost = policy == "leftmost"
+        sampler.random_mode = policy == "random"
+        sampler.threshold_mode = policy == "confidence_threshold"
+
+    def reconfigure_dllm(
+        self, overrides: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        """Change decode knobs on the live masked-diffusion sampler.
+
+        Returns the previous values in the same shape, so the caller can hand
+        them straight back to restore the rollout configuration, or None if
+        there was nothing to change.
+
+        The caller must ensure no requests are in flight. The sampler is shared
+        engine state, so switching policy mid-flight would decode part of a
+        sequence under one policy and the rest under another.
+        """
+        if not overrides:
+            return None
+
+        unknown = sorted(set(overrides) - set(self._RECONFIGURABLE_DLLM_KNOBS))
+        if unknown:
+            raise ValueError(
+                f"Cannot reconfigure diffusion knob(s) {unknown} on a live engine; "
+                f"only {list(self._RECONFIGURABLE_DLLM_KNOBS)} are re-read every "
+                "denoising step. The rest are consumed when the model loads and "
+                "need a separate engine group."
+            )
+
+        sampler = getattr(self.model_runner, "sampler", None)
+        if sampler is None or not hasattr(sampler, "diffusion_states"):
+            raise RuntimeError(
+                "reconfigure_dllm needs the masked-diffusion sampler, but this "
+                "engine is not running a diffusion model."
+            )
+
+        previous: dict[str, Any] = {}
+        if "selection_policy" in overrides:
+            previous["selection_policy"] = self._read_selection_policy(sampler)
+            self._write_selection_policy(sampler, overrides["selection_policy"])
+        if "confidence_threshold" in overrides:
+            previous["confidence_threshold"] = math.exp(sampler.log_threshold)
+            sampler.log_threshold = math.log(float(overrides["confidence_threshold"]))
+        if "temperature" in overrides:
+            previous["temperature"] = float(sampler.temperature)
+            sampler.temperature = float(overrides["temperature"])
+        if "max_denoising_steps" in overrides:
+            states = sampler.diffusion_states
+            previous["max_denoising_steps"] = int(states.max_denoising_steps)
+            states.max_denoising_steps = int(overrides["max_denoising_steps"])
+        return previous
 
     def _maybe_process_fp8_kv_cache(self) -> None:
         """Process weights after loading for FP8 KV cache (static scales)."""

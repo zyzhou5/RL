@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import argparse
+import copy
 import os
 import pprint
 
@@ -220,7 +221,23 @@ The validation set you pass in will directly be used for validation with no addi
     # Bind task_to_env and val_task_to_env for nemo_gym env
     # Hardcode here to match `run_async_nemo_gym_rollout`
     task_to_env = {"nemo_gym": nemo_gym}
-    val_task_to_env = task_to_env
+
+    # Generation on the NeMo-Gym path goes to the Gym servers rather than
+    # through policy_generation, and the policy base URLs are fixed when the env
+    # is built. A dedicated validation engine group therefore needs its own Gym
+    # env pointed at that group's servers; sharing the rollout env would leave
+    # validation silently decoding on the rollout engines.
+    if val_policy_generation is not None:
+        val_nemo_gym_config = NemoGymConfig(
+            model_name=val_policy_generation.cfg["model_name"],
+            base_urls=val_policy_generation.dp_openai_server_base_urls,
+            initial_global_config_dict=copy.deepcopy(config["env"]["nemo_gym"]),
+        )
+        val_nemo_gym = create_env(env_name="nemo_gym", env_config=val_nemo_gym_config)
+        ray.get(val_nemo_gym.health_check.remote())
+        val_task_to_env = {"nemo_gym": val_nemo_gym}
+    else:
+        val_task_to_env = task_to_env
 
     if is_trajectory_collection:
         collect_trajectories(
