@@ -372,6 +372,11 @@ def launch_server(args: argparse.Namespace, dllm_config: Path | None) -> subproc
     if args.backend == "vllm":
         env["VLLM_USE_V1"] = "1"
         env["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
+        # The container exports PYTHONPATH=/opt/nemo_rl_venv/.../site-packages for the
+        # client; that leaks into the external vLLM python-compat and shadows its own
+        # (correctly-built) torch with the container torch -> C-extension load failure.
+        # python-compat is a self-contained venv (editable .pth), so drop PYTHONPATH.
+        env.pop("PYTHONPATH", None)
     else:
         check_sglang_commit(args.sglang_repo, args.sglang_commit)
         env.setdefault("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK", "1")

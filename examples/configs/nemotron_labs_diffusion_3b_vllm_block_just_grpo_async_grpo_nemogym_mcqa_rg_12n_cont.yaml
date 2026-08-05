@@ -1,0 +1,53 @@
+# Continuation of grpo_nd3b_mcqa_rg_12n from step_90.
+#
+# The first leg (job 15084550) TIMEOUT at 4h with 93/100 steps and is the only run
+# in this series that clearly learned:
+#   val accuracy  0.2388 -> 0.3205 over 90 steps (+34%)
+#   mcqa          0.3164 -> 0.4141 (+31%)
+#   reasoning_gym 0.1613 -> 0.2268 (+41%)
+#   avg_length     494  ->  318 tokens (-36%, monotone)
+# The curve was still rising at step 90, hence this continuation.
+#
+# max_num_steps 100 -> 300: resuming at step 90 under the old cap would run 7 steps.
+# ~80s/step means a 4h window reaches roughly step 270. Note 12,296 train rows /
+# 128 per step = ~96 steps per epoch, so this run moves from ~1 epoch to ~2.8.
+#
+# TWO CHANGES vs the first leg, both inherited rather than set here -- val numbers
+# will NOT be on the same scale as steps 10-90:
+#  1. data.validation.repeat 2 -> 4 (1024 val generations; halves sampling SE).
+#  2. vllm_val_dllm_overrides now exists in the parent
+#     (deepscaler_..._3b_vllm_block_just_grpo_megatron.yaml, added 2026-08-04 18:38,
+#     i.e. AFTER leg 1 started -- confirmed absent from that run's saved
+#     checkpoints/step_90/config.yaml). Validation now decodes with
+#     selection_policy=confidence_threshold @ 0.9 while rollouts stay leftmost.
+#     Expect a level shift at step 100; compare 100+ against itself, not against 10-90.
+defaults: "nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_nemogym_mcqa_rg_12n.yaml"
+
+grpo:
+  max_num_steps: 300
+
+policy:
+  megatron_cfg:
+    scheduler:
+      # Raising max_num_steps changes the scheduler's total-iteration count, which
+      # Megatron stores in the checkpoint and asserts on resume. Leg 1 was capped at
+      # 100 steps, so a plain resume at 300 dies with (job 15113406):
+      #   AssertionError: OptimizerParamScheduler: class input value 307200 and
+      #   checkpoint value 102400 for total number of weight decay iterations do not match
+      #   (307200/102400 = 3 = the 300/100 step ratio)
+      # These two flags tell it to take the schedule from THIS config and ignore the
+      # checkpoint's. They are mutually exclusive -- optimizer_param_scheduler.py:175
+      # asserts NOT use_checkpoint when override is set, and Bridge re-checks at
+      # config.py:536. Reaches SchedulerConfig via setup.py:698, which splats this
+      # whole block: SchedulerConfig(**config[megatron_cfg][scheduler]).
+      #
+      # NOTE this overrides the ENTIRE scheduler state, not just the iteration count.
+      # Safe here because lr_decay_style is constant and lr_warmup_iters is 13, so
+      # at step 90 the LR is already flat -- there is no curve position to lose. On a
+      # cosine/WSD schedule this would silently reposition the model on a new curve.
+      override_opt_param_scheduler: true
+      use_checkpoint_opt_param_scheduler: false
+
+logger:
+  wandb:
+    name: "nd3b_vllm_block_async_grpo_nemogym_mcqa_rg_12n_cont"

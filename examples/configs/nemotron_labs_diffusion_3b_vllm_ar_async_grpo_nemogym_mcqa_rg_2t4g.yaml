@@ -1,0 +1,56 @@
+# AR GRPO on the mcqa + reasoning_gym subsets, 3B, 2 train + 4 gen (6 nodes).
+#
+# AR cross of two proven configs:
+#   - dataset + env inherited from the diffusion mcqa_rg config: the v30_deterministic
+#     train_mcqa_rg.jsonl / val_mcqa_rg.jsonl files, val repeat 4, and the 2-server
+#     config_paths (mcqa + reasoning_gym).
+#   - policy overrides copied from the proven vLLM-AR mathcode config: AR is selected
+#     purely by vllm_kwargs.diffusion_config null (vllm_worker.py:141 does
+#     get("diffusion_config") or {}), plus the AR policy worker and 2x micro-batch the
+#     AR path (no noisy/clean layout, no reveal passes) affords.
+#
+# TOPOLOGY. 2 train + 4 gen. train_global_batch_size 1024 must stay divisible by
+# dp = train_nodes * 8; 2 train nodes -> dp 16 -> 64 per rank, valid.
+#
+# UNVERIFIED -- run a toy before an at-scale run:
+#  1. diffusion_config null actually disables leftmost-reveal on the gen workers.
+#  2. the AR worker wants block-diffusion attention disabled (block_size 16 still
+#     inherited so the cached HF->mcore conversion is reused, no conversion cost).
+defaults: "nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_nemogym_mcqa_rg_12n.yaml"
+
+cluster:
+  num_nodes: 6                       # 2 train + 4 gen
+
+policy:
+  worker_cls_fqn: "nemo_rl.models.policy.workers.nemotron_diffusion_megatron_policy_worker.NemotronDiffusionMegatronPolicyWorker"
+  # mb=4 for throughput (parity with the mathcode AR config). NOTE: with max_new_tokens
+  # 4096 this can OOM the training log-softmax [mb x seq x vocab] on the long-prompt/
+  # long-response tail (~10 GiB headroom; mb=4 x ~4800-tok content ~= the limit). Fall
+  # back to mb=2/3 or train-side TP=2 (shard vocab) if OOM recurs.
+  train_micro_batch_size: 4
+  logprob_batch_size: 4
+  generation:
+    # Match the diffusion run's generation budget (4096) for a like-for-like comparison.
+    # Honored via the vLLM serving.py Harmony-branch fix (b3b54de96).
+    max_new_tokens: 4096
+    colocated:
+      resources:
+        num_nodes: 4                 # gen nodes
+    vllm_kwargs:
+      diffusion_config: null         # AR decoding (harmless; is_diffusion is False)
+      # Load the checkpoint as a causal LM (vLLM analog of SGLang json_model_override
+      # ar_mode: true). Selects NemotronLabsDiffusionForCausalLM -> is_diffusion False
+      # -> standard causal AR decode. Needs the AR class in the gen runtime
+      # (nemotron_dllm_792ab07, commit 0a8070b68) via NRL_VLLM_PY_EXECUTABLE.
+      hf_overrides:
+        architectures: ["NemotronLabsDiffusionForCausalLM"]
+    vllm_val_dllm_overrides: null    # AR engine has no diffusion sampler to reconfigure
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-vllm-ar-async-grpo-nemogym-mcqa-rg"
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-ar-async-grpo-nemogym-mcqa-rg"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_ar_async_grpo_nemogym_mcqa_rg_2t4g"

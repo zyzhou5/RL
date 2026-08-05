@@ -1,0 +1,46 @@
+# Toy smoke of the AR mcqa_rg setup: 3 nodes (2 train + 1 gen), 8x8, 2 steps,
+# tiny balanced validation AND a checkpoint EVERY step. Inherits the AR mcqa_rg
+# config (worker, 4k+4k, diffusion_config null, mcqa+reasoning_gym servers, data)
+# and shrinks ONLY compute + validation. Purpose is correctness, not throughput.
+#
+# Confirms: (1) AR decode is active (diffusion_config None, no leftmost-reveal);
+# (2) NemotronDiffusionMegatronPolicyWorker loads with inherited block_size 16 and
+# reuses the cached HF->mcore conversion; (3) two steps complete, validation
+# produces metrics, AND the checkpoint-save path works (save_period 1).
+#
+# 2 train + 1 gen -> dp = 16 so tgbs 64 divides evenly. Cannot validate the 2+4
+# topology, only correctness.
+defaults: "nemotron_labs_diffusion_3b_vllm_ar_async_grpo_nemogym_mcqa_rg_2t4g.yaml"
+
+cluster:
+  num_nodes: 3                       # 2 train + 1 gen
+
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 2
+  val_period: 1                      # validate every step
+  val_at_start: false
+
+policy:
+  train_global_batch_size: 64        # 8 x 8; dp=16 -> 4 samples/rank
+  generation:
+    colocated:
+      resources:
+        num_nodes: 1
+
+data:
+  validation:
+    dataset_name: NemoGymDataset
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/val_mcqa_rg_toy.jsonl"
+    repeat: 1                        # 16 rows x 1
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-vllm-ar-async-grpo-nemogym-mcqa-rg-TOY"
+  save_period: 1                     # checkpoint EVERY step (smoke the save path)
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-ar-async-grpo-nemogym-mcqa-rg-toy"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_ar_async_grpo_nemogym_mcqa_rg_toy"

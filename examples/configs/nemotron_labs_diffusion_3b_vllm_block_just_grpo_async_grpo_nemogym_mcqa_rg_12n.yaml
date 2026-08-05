@@ -33,7 +33,9 @@ data:
   validation:
     dataset_name: NemoGymDataset
     data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_deterministic/val_mcqa_rg.jsonl"
-    repeat: 2                        # 256 x 2 = 512 val generations
+    repeat: 4                        # 256 x 4 = 1024 val generations (was 2; halves
+                                     # sampling SE on the fixed val prompts, which is what
+                                     # limits trend detection -- see header note)
 
 env:
   nemo_gym:
