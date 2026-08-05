@@ -27,6 +27,7 @@ from nemo_rl.data.datasets.response_datasets.general_conversations_dataset impor
 )
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
+from nemo_rl.data.datasets.response_datasets.math_train import MathTrainDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.nemotron_cascade2_sft import (
@@ -57,6 +58,7 @@ DATASET_REGISTRY = {
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
     "DeepScaler": DeepScalerDataset,
+    "MATH": MathTrainDataset,
     "geometry3k": Geometry3KDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "open_assistant": OasstDataset,
@@ -113,6 +115,7 @@ __all__ = [
     "DAPOMathAIME2024Dataset",
     "GSM8KDataset",
     "DeepScalerDataset",
+    "MathTrainDataset",
     "Geometry3KDataset",
     "HelpSteer3Dataset",
     "NemoGymDataset",

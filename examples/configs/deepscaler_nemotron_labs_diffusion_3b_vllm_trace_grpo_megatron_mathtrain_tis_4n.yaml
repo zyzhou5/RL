@@ -1,0 +1,27 @@
+# Confidence-threshold TraceGRPO on MATH train, vLLM, 4 nodes, WITH TIS.
+# Sibling of ..._mathtrain.yaml that (a) turns on truncated importance sampling
+# (use_importance_sampling_correction + tis, ratio 2.0) to test whether clamping
+# the prev/gen ratio changes the confidence-decode collapse, and (b) runs at
+# 4 nodes. Everything else (vLLM confidence_threshold 0.9 decode, trace
+# estimator, MATH data, official ckpt) inherited unchanged.
+# Submit: NODES=4, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_reveal_steps/bin/python-compat
+defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_megatron_mathtrain.yaml"
+
+cluster:
+  num_nodes: 4
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: null
+
+checkpointing:
+  save_period: 25
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-mathtrain-vllm-tis-4n"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-mathtrain-vllm-tis-4n"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-mathtrain-vllm-tis-4n"

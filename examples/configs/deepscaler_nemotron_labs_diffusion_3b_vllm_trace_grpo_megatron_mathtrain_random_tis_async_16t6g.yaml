@@ -1,0 +1,22 @@
+# Random+TIS async-GRPO on MATH train, vLLM, 22 nodes = 16 training + 6
+# generation. Child of the 4-node random async config; scales topology to
+# 16 train (DP 128) + 6 gen nodes. Submit NODES=22.
+defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_megatron_mathtrain_random_tis_async_4n.yaml"
+
+cluster:
+  num_nodes: 22   # 16 training + 6 generation
+
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 8
+        num_nodes: 6
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-mathtrain-vllm-random-tis-async-16t6g"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-mathtrain-vllm-random-tis-async-16t6g"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-mathtrain-vllm-random-tis-async-16t6g"

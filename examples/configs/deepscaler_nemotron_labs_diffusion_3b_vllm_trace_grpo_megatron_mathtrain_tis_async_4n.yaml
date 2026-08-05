@@ -1,0 +1,49 @@
+# Confidence-threshold TraceGRPO on MATH train, vLLM, FULL ASYNC-GRPO + TIS,
+# 4 nodes (2 training + 2 generation, non-colocated).
+#
+# Child of the confidence mathtrain config. Adds: (1) grpo.async_grpo.enabled
+# (overlapped rollout collection, trajectory age <= 1), (2) TIS importance-
+# sampling correction (required by async_grpo for off-policy samples; ratio
+# 2.0), (3) non-colocated inference on 2 dedicated generation nodes.
+#
+# Node math: cluster.num_nodes = train + gen. 2 gen nodes leaves 2 train
+# nodes -> DP = 2*8 = 16 (TP/PP/CP=1), and train_global_batch_size 1024
+# divides evenly (64/rank). 2 gen nodes because MATH rollouts are long
+# (mirrors the DeepScaleR async topology, not sudoku's single gen node);
+# watch buffer_filled_ratio and add a gen node if the collector starves.
+# Submit: NODES=4, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_reveal_steps/bin/python-compat
+defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_megatron_mathtrain.yaml"
+
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: null
+
+policy:
+  generation:
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2
+    vllm_cfg:
+      async_engine: true
+
+cluster:
+  num_nodes: 4   # 2 training + 2 generation
+
+checkpointing:
+  save_period: 10
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-mathtrain-vllm-conf-tis-async-4n"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-mathtrain-vllm-conf-tis-async-4n"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-mathtrain-vllm-conf-tis-async-4n"
