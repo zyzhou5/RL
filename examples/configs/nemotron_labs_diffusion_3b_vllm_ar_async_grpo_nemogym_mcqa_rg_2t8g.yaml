@@ -1,0 +1,22 @@
+# AR mcqa_rg, 2 train + 8 gen (10 nodes). Same training as 2t4g (dp=16, mbs 4,
+# max_new_tokens 4096, hf_overrides AR arch); ONLY doubles the gen pool 4 -> 8.
+# Rationale: AR is generation-bound (leftmost/causal decode is 1 token/forward pass,
+# sequential; ~47s total gen vs ~16s train-side at 2t4g, leaving ~31s exposed).
+# 8 gen nodes ~halve gen wall-time -> less exposed -> faster step. Training compute
+# per step is UNCHANGED (2 train nodes, dp=16); this improves step throughput, not
+# the training stage itself.
+defaults: "nemotron_labs_diffusion_3b_vllm_ar_async_grpo_nemogym_mcqa_rg_2t4g.yaml"
+
+cluster:
+  num_nodes: 10                      # 2 train + 8 gen
+
+policy:
+  generation:
+    colocated:
+      resources:
+        num_nodes: 8                 # gen nodes (was 4)
+
+logger:
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_ar_async_grpo_nemogym_mcqa_rg_2t8g"

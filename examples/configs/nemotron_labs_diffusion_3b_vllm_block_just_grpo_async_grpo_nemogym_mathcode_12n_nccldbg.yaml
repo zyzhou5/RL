@@ -1,0 +1,28 @@
+# 8 train + 4 gen (12 nodes), same as the _12n config, plus NCCL diagnostics.
+#
+# The checkpoint NCCL failure is transient, not deterministic: job 15070086 died at
+# the first save (step 10, 64 train ranks) with
+#   save_state_dict_async_plan -> gather_object -> NCCL Error 2: unhandled system error
+# but job 15074986 (same 8+2 topology, same 64 ranks, save_period 1) wrote 6/6
+# checkpoints cleanly with 0 NCCL errors. Prior block_just_grpo experience puts the
+# incidence around 30%, so a 4h run is likely to hit it.
+#
+# NCCL_DEBUG=INFO only prints on error, so it costs log volume and nothing else --
+# but without it the failure reports the opaque code 2 with no failing syscall or
+# transport, which is exactly the dead end job 15070086 left us in.
+#
+# save_period stays at the inherited 10. Dropping it to 1 is the other validated
+# mitigation (a transient failure then costs 1 step instead of 10, and keep_top_k=2
+# caps disk at ~86 GB) -- not applied here since only the debug flag was requested.
+defaults: "nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_nemogym_mathcode_12n.yaml"
+
+policy:
+  megatron_cfg:
+    # deep-merges with inherited env_vars (PYTHONPATH, TORCHINDUCTOR_*, DIFFU_FLEX_*)
+    env_vars:
+      NCCL_DEBUG: 'INFO'
+
+logger:
+  log_dir: "logs/grpo-nd3b-vllm-block-justgrpo-async-grpo-nemogym-mathcode-12n-nccldbg"
+  wandb:
+    name: "nd3b_vllm_block_async_grpo_nemogym_mathcode_12n_nccldbg"
