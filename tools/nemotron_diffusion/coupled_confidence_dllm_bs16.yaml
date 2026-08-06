@@ -1,0 +1,11 @@
+# FastDiffuser confidence generation at block_size=16 (copy of
+# coupled_fastdiffuser_final_step.yaml with block_size/max_steps -> 16).
+# selection_policy stays "confidence" (threshold 0.9); logprob_mode=final_step.
+algorithm: FastDiffuser
+block_size: 16
+max_steps: 16
+causal_context: true
+temperature: 1.0
+threshold: 0.9
+selection_policy: confidence
+logprob_mode: final_step

@@ -23,11 +23,13 @@ cluster:
 
 policy:
   worker_cls_fqn: "nemo_rl.models.policy.workers.nemotron_diffusion_megatron_policy_worker.NemotronDiffusionMegatronPolicyWorker"
-  # mb=4 for throughput (parity with the mathcode AR config). NOTE: with max_new_tokens
-  # 4096 this can OOM the training log-softmax [mb x seq x vocab] on the long-prompt/
-  # long-response tail (~10 GiB headroom; mb=4 x ~4800-tok content ~= the limit). Fall
-  # back to mb=2/3 or train-side TP=2 (shard vocab) if OOM recurs.
-  train_micro_batch_size: 4
+  # mb=2. The mb=4 OOM predicted below DID recur: job 15161345 died at step 58
+  # (2026-08-05 14:09:55) with torch.OutOfMemoryError in
+  # _compute_distributed_log_softmax (model_utils.py:63), all 16 train ranks,
+  # requesting 14.66 GiB with 7.17 GiB free. mb=2 halves the [mb x seq x vocab]
+  # temporary to ~7.3 GiB. Next fallback if it recurs: train-side TP=2 (shard vocab).
+  # logprob_batch_size stays 4 -- that path runs inference_only and never OOMed.
+  train_micro_batch_size: 2
   logprob_batch_size: 4
   generation:
     # Match the diffusion run's generation budget (4096) for a like-for-like comparison.

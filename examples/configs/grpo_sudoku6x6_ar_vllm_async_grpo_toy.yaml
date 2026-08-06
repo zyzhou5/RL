@@ -1,0 +1,52 @@
+# Toy smoke of the sudoku6x6 AR-over-vLLM async-GRPO setup: 3 nodes
+# (2 train + 1 gen), 32 prompts x 8 generations, 2 steps, no checkpointing.
+# Shrinks ONLY compute and validation; every policy / engine / task setting is
+# inherited, including the parent's train_micro_batch_size / logprob_batch_size
+# of 8.
+#
+# Confirms: (1) AR decode is actually active over vLLM -- diffusion_config null
+# plus NemotronLabsDiffusionForCausalLM, i.e. no leftmost-reveal / canvas in the
+# engine log; (2) the sudoku6x6 generator, few-shot prompt and blanks-only
+# reward path score AR rollouts; (3) async-GRPO collection and the
+# non-colocated weight refit complete two steps and a validation pass.
+#
+# BATCH SIZING. train_global_batch_size must be divisible by dp AND the result
+# must be divisible by the micro-batch sizes. Here dp = 2 * 8 = 16, so tgbs 256
+# -> 16 per rank -> 2 microbatches of 8, the same per-rank shape AND microbatch
+# count the 9-node run gets (1024 / dp 64 = 16). Keeping those equal is the
+# point of the toy: it is what makes a clean smoke here evidence about the real
+# run. An earlier tgbs of 64 gave 4 per rank and tripped
+# batched_data_dict.py:811 "Data dict size (4) is not a multiple of the provided
+# microbatch size (16)" in get_logprobs, AFTER generation and reward scoring had
+# already succeeded -- so mis-sizing here fails late, not at config load.
+# Cannot validate the 8+1 topology, only correctness.
+defaults: "grpo_sudoku6x6_ar_vllm_async_grpo.yaml"
+
+cluster:
+  num_nodes: 3                 # 2 train + 1 gen
+
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  max_num_steps: 2
+  val_period: 1                # validate every step
+  val_at_start: false
+  max_val_samples: 64
+
+policy:
+  train_global_batch_size: 256  # 32 x 8; dp 16 -> 16 per rank -> 2 mb of 8
+
+data:
+  validation:
+    size: 16                   # 16 puzzles x repeat 1
+    repeat: 1
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: "results/grpo-nd3b-ar-sudoku6x6-vllm-async-grpo-TOY"
+
+logger:
+  log_dir: "logs/grpo-nd3b-ar-sudoku6x6-vllm-async-grpo-toy"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_ar_sudoku6x6_vllm_async_grpo_toy"

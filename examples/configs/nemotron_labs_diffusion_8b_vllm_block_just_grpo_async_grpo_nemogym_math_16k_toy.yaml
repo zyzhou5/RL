@@ -1,0 +1,32 @@
+# Toy smoke of the math_with_judge 16K run: 3 nodes (2 train + 1 gen), tiny batch,
+# 2 steps, small val every step. Inherits the full math_16k config (8B v1.5-sft,
+# Fast, TP8 x CP2 + SP, gym math_with_judge only, math_with_judge data split,
+# 16K sequence budget) and shrinks only compute + validation.
+# Purpose: confirm Gym spinup with the reduced (2-server) surface, the new
+# dataset, and the 16K memory shape before the 16-node run.
+defaults: "nemotron_labs_diffusion_8b_vllm_block_just_grpo_async_grpo_nemogym_math_16k.yaml"
+
+cluster:
+  num_nodes: 3                       # 2 train (TP8 x CP2 => dp=1) + 1 gen
+
+grpo:
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 8
+  max_num_steps: 2
+  val_period: 1                      # validate every step (exercise the val path early)
+
+policy:
+  train_global_batch_size: 32        # 4 x 8
+  generation:
+    max_new_tokens: 2048             # shorter than the 8192 production budget for a fast smoke
+    colocated:
+      resources:
+        num_nodes: 1                 # 1 dedicated gen node
+
+data:
+  validation:
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_math_with_judge/val_toy.jsonl"   # 32 rows
+    repeat: 1
+
+checkpointing:
+  save_period: 100                   # > max_num_steps -> no checkpoint save during the smoke
