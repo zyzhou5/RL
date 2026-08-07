@@ -31,7 +31,15 @@ grpo:
   max_num_steps: 2
   val_period: 1                # validate every step
   val_at_start: false
-  max_val_samples: 64
+  # max_val_samples // val_batch_size is max_batches (grpo.py:2798), and the
+  # validation loop body is what binds additional_metrics_to_report (2839),
+  # read unconditionally after the loop (2935). So max_batches 0 does not
+  # validate zero batches harmlessly -- it raises UnboundLocalError. The
+  # inherited val_batch_size is 128 (gsm8k AR parent) and an earlier
+  # max_val_samples of 64 gave 64 // 128 = 0, killing the run right after
+  # step 1 trained. Both are pinned to the 16-sample val set -> exactly 1 batch.
+  max_val_samples: 16
+  val_batch_size: 16
 
 policy:
   train_global_batch_size: 256  # 32 x 8; dp 16 -> 16 per rank -> 2 mb of 8
