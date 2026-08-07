@@ -1,0 +1,46 @@
+# Random-order TraceGRPO on the AGRPO-matched MATH train set, vLLM, async-GRPO + TIS,
+# 4 nodes (2 training + 2 generation).
+#
+# Identical to the mathtrain random+TIS async 4n config except the training data:
+# it points at the exact replication of AGRPO's load_math_train()
+# (arXiv:2510.04019, github.com/probablyabot/agrpo data.py) -- 8502 problems built
+# from qwedsacf/competition_math with their three filters:
+#   1. drop the 500 HuggingFaceH4/MATH-500 test problems  (-500)
+#   2. keep level <= 4  ("too hard for LLaDA")            (-3496)
+#   3. answer = extract_boxed(solution), drop empty        (-2)
+#
+# CONTAMINATION NOTE: their source is the FULL MATH dataset, so this set contains
+# MATH *test* problems (the 4500 that are not in MATH-500). Safe for MATH-500
+# evaluation, NOT safe for other MATH-test-based benchmarks. The clean
+# train-split-only variant (5192 rows) lives at eval_data/math_train_agrpo/.
+#
+# Validation stays AIME2024 (inherited); MATH-500 is an eval-harness dataset
+# (`math500`), not a training-loop validation set, so score it with run_eval.py.
+#
+# Submit: NODES=4, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_reveal_steps/bin/python-compat
+defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_megatron_mathtrain_random_tis_async_4n.yaml"
+
+data:
+  train:
+    dataset_name: MATH
+    data_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_data/math_train_agrpo_exact/train.jsonl"
+  validation:
+    # MATH-500, the benchmark AGRPO reports. It is registered only in the EVAL
+    # harness (dataset_name "math500"), so load it here through the MATH loader
+    # by path -- same problem/answer schema. repeat pinned to 1 so the parent's
+    # AIME2024 repeat: 16 does not leak in (the MATH loader would ignore it, but
+    # leaving it would be misleading). 500 problems < max_val_samples, so all are
+    # scored. NOTE: training is capped at level <= 4 while MATH-500 spans levels
+    # 1-5 (134 are level 5), matching AGRPO's own train/eval asymmetry.
+    dataset_name: MATH
+    data_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_data/math500_val/val.jsonl"
+    repeat: 1
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-math_agrpo-vllm-random-tis-async-4n"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-math_agrpo-vllm-random-tis-async-4n"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-math_agrpo-vllm-random-tis-async-4n"

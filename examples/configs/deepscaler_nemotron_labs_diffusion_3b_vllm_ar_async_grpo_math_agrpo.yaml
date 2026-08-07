@@ -1,0 +1,85 @@
+# AR GRPO on the AGRPO-matched MATH train set, vLLM generation, async-GRPO + TIS,
+# 4 nodes (2 training + 2 generation). Head-to-head partner of
+# deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_math_agrpo.yaml:
+# same data, same topology, same async-GRPO + TIS stack, only the decode and
+# algorithm differ.
+#
+# Two-parent cross, the pattern used by every vLLM config here:
+#   - deepscaler_..._sglang_ar_megatron.yaml   AR algorithm + math env, seq 4096 /
+#     max_new_tokens 3744, KL off, val AIME2024 repeat 16, mb 4.
+#   - nemotron_labs_diffusion_3b_vllm_generation_common.yaml   the vLLM engine
+#     section, listed SECOND so it wins the backend swap (the inherited sglang_cfg
+#     with json_model_override_args ar_mode is then inert).
+#
+# AR is selected the same way as the sudoku/mcqa AR configs:
+#   - vllm_kwargs.diffusion_config: null  -> no diffusion sampler / canvas.
+#   - hf_overrides.architectures: NemotronLabsDiffusionForCausalLM -> the engine
+#     loads the checkpoint as a causal LM (is_diffusion False). REQUIRES the
+#     grpo.py fix that MERGES hf_overrides instead of overwriting it with
+#     policy.hf_config_overrides -- without it this key is silently dropped and
+#     the run is served as masked-canvas diffusion at temperature 0.
+#
+# Training data: exact replication of AGRPO's load_math_train() (arXiv:2510.04019)
+# -- 8502 problems, level <= 4, MATH-500 removed. See that repo's data.py.
+# CONTAMINATION NOTE: contains MATH *test* problems other than MATH-500. Safe for
+# MATH-500 evaluation only; the clean train-only variant is eval_data/math_train_agrpo/.
+#
+# Submit: NODES=4, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_792ab07/bin/python-compat
+defaults:
+  - "deepscaler_nemotron_labs_diffusion_3b_sglang_ar_megatron.yaml"
+  - "nemotron_labs_diffusion_3b_vllm_generation_common.yaml"
+
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+
+loss_fn:
+  # Required by async_grpo_train (off-policy correction), with the same TIS clamp
+  # the Trace partner run uses so a heavy logprob tail cannot reach the gradient.
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"
+  truncated_importance_sampling_ratio: 2.0
+  truncated_importance_sampling_ratio_min: null
+
+policy:
+  generation:
+    vllm_cfg:
+      async_engine: true
+    vllm_kwargs:
+      diffusion_config: null   # AR decoding: no diffusion sampler, no canvas
+      hf_overrides:
+        architectures: ["NemotronLabsDiffusionForCausalLM"]
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2           # 2 generation nodes; cluster.num_nodes - 2 train
+
+cluster:
+  num_nodes: 4                 # 2 training + 2 generation -> DP 16, 64 per rank
+
+data:
+  train:
+    dataset_name: MATH
+    data_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_data/math_train_agrpo_exact/train.jsonl"
+  validation:
+    # MATH-500, the benchmark AGRPO reports. It is registered only in the EVAL
+    # harness (dataset_name "math500"), so load it here through the MATH loader
+    # by path -- same problem/answer schema. repeat pinned to 1 so the parent's
+    # AIME2024 repeat: 16 does not leak in (the MATH loader would ignore it, but
+    # leaving it would be misleading). 500 problems < max_val_samples, so all are
+    # scored. NOTE: training is capped at level <= 4 while MATH-500 spans levels
+    # 1-5 (134 are level 5), matching AGRPO's own train/eval asymmetry.
+    dataset_name: MATH
+    data_path: "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_genai/users/snorouzi/eval_data/math500_val/val.jsonl"
+    repeat: 1
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-ar-math_agrpo-vllm-async-grpo-4n"
+
+logger:
+  log_dir: "logs/grpo-nd3b-ar-math_agrpo-vllm-async-grpo-4n"
+  wandb:
+    name: "grpo-nd3b-ar-math_agrpo-vllm-async-grpo-4n"
