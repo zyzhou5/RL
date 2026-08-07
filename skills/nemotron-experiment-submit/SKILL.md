@@ -154,10 +154,18 @@ sshare -U -u $USER -o Account,User,RawShares,NormShares,RawUsage,EffectvUsage,Fa
 
 The `FairShare` column is what matters (higher = better priority, range 0-1). Choose the account with the largest value, with two caveats:
 
-- Restrict the choice to accounts compatible with this work: the run dirs and HF cache live under the `coreai` portfolio (`/lustre/fsw/portfolios/coreai/...`), so use a `coreai_dlalgo_*` account. Do not use a non-coreai account such as `nvr_lpr_llm` even if it shows a higher FairShare, since it does not have access to these paths/partition.
+- Eligible accounts are the `coreai_dlalgo_*` ones **and `nvr_lpr_llm`**. `nvr_lpr_llm` DOES reach the
+  `coreai` portfolio paths: runs under it write to `/lustre/fsw/portfolios/coreai/users/$USER/runs/...`
+  and read the HF cache there without trouble (e.g. job 15191105, a 10-node `nd3b_ar_mcqa_rg` run). It has
+  consistently carried the highest FairShare (~0.75-0.81) and schedules in ~1 min versus ~25 min on coreai,
+  so it is usually the fastest way onto the cluster. Caveat: its `batch_short` allocation is capped at
+  20 nodes / 4 jobs per user, so very large fan-outs still belong on a coreai account.
+- Do NOT use `coreai_dlalgo_modelopt`, even when its FairShare is the highest.
 - An account's FairShare drops as its recent usage rises, so the best choice changes over time. Re-check `sshare` for each new submission rather than hardcoding one account.
 
-In practice `coreai_dlalgo_genai` has had a higher FairShare than the wrapper default `coreai_dlalgo_llm` (whose FairShare is depressed by heavy recent usage), so prefer `ACCOUNT=coreai_dlalgo_genai` unless `sshare` says otherwise at submit time.
+Among the coreai accounts, `coreai_dlalgo_genai` and `coreai_dlalgo_llm` trade places from hour to hour as
+usage accrues (the wrapper default is `coreai_dlalgo_llm`), so let `sshare` decide at submit time rather
+than defaulting to either.
 
 ## Common Configs
 
