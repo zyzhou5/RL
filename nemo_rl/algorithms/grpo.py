@@ -914,10 +914,15 @@ def setup(
                 "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
             )
 
-        ## make vllm hf overrides match the training policy
-        generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
-            "hf_config_overrides", {}
-        )
+        ## make vllm hf overrides match the training policy. MERGE rather than
+        ## assign: a job YAML may set vllm_kwargs.hf_overrides directly (AR runs
+        ## select the causal-LM class via hf_overrides.architectures), and a plain
+        ## assignment dropped it whenever the policy had no hf_config_overrides.
+        ## The generation-side value wins as the more specific setting.
+        generation_config["vllm_kwargs"]["hf_overrides"] = {
+            **(policy_config.get("hf_config_overrides") or {}),
+            **(generation_config["vllm_kwargs"].get("hf_overrides") or {}),
+        }
 
         # Optionally launch the validation-only engine group first, while GPU
         # memory is still clean, then put it to sleep so the rollout engines and
