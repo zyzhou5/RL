@@ -1,0 +1,45 @@
+# Continuation of mcqa_rg_ar_2t8g_fixed past step 100.
+#
+# The run (legs 15517473 FAILED on an EngineCore port race, 15517474 TIMEOUT at 4h,
+# 15519030 cancelled at 1:07) reached step_100 and stopped there because the shared
+# NeMo-Gym parent capped max_num_steps at 100. That cap has since been raised to 300
+# in nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_nemogym_mathcode.yaml,
+# so the 2t8g config now resolves to 300 on its own -- but it is pinned explicitly
+# here so this continuation cannot drift if that shared parent is edited again.
+#
+# RESUME MECHANICS. The submit wrapper sets checkpointing.checkpoint_dir to
+# ${RUNDIR}/checkpoints (submit_grpo_nemotron_ar_megatron_sbatch.sh:49,191), so
+# these legs MUST reuse RUN_NAME=mcqa_rg_ar_2t8g_fixed to land in the same run dir
+# and pick up step_100. NODES must stay 10 (2 training + 8 generation): Megatron
+# distributed-optimizer checkpoints do not reshard across DP widths, and every
+# prior leg ran at 10.
+defaults: "nemotron_labs_diffusion_3b_vllm_ar_async_grpo_nemogym_mcqa_rg_2t8g.yaml"
+
+grpo:
+  max_num_steps: 300
+
+policy:
+  megatron_cfg:
+    scheduler:
+      # Raising max_num_steps changes the scheduler's total-iteration count, which
+      # Megatron stores in the checkpoint and asserts against on resume. step_100 was
+      # written under the 100-step cap, so a plain resume at 300 dies with:
+      #   AssertionError: OptimizerParamScheduler: class input value <3x> and
+      #   checkpoint value <1x> for total number of weight decay iterations do not match
+      # These two flags take the schedule from THIS config and ignore the
+      # checkpoint's. They are mutually exclusive -- optimizer_param_scheduler.py:175
+      # asserts NOT use_checkpoint when override is set, and Bridge re-checks at
+      # config.py:536. Reaches SchedulerConfig via setup.py:698, which splats this
+      # whole block.
+      #
+      # This replaces the ENTIRE scheduler state, not just the iteration count. Safe
+      # here for the same reason as the block-JustGRPO _cont config: lr_decay_style is
+      # constant and lr_warmup_iters is 13, so by step 100 the LR has long been flat at
+      # 3e-07 and there is no curve position to lose. On a cosine or WSD schedule this
+      # would silently reposition the model on a new curve.
+      override_opt_param_scheduler: true
+      use_checkpoint_opt_param_scheduler: false
+
+logger:
+  wandb:
+    name: "nd3b_vllm_ar_async_grpo_nemogym_mcqa_rg_2t8g_cont"

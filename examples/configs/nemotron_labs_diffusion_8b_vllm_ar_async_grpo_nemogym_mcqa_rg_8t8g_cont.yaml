@@ -1,0 +1,57 @@
+# Continuation of mcqa_rg_ar_8b_8t8g past step 100.
+#
+# The 8B AR run is the strongest curve in the mcqa_rg series -- val accuracy roughly
+# DOUBLED over the first 100 steps and was still climbing steeply when it stopped:
+#   step   10     20     30     40     50     60     70     80     90    100
+#   acc  .1285  .1253  .1286  .1352  .1640  .1691  .1921  .1978  .2252  .2567
+#   len  2288   2116   1791   1409   1050    960    805    649    646    432
+# It stopped only because the shared NeMo-Gym parent capped max_num_steps at 100
+# (legs 15518731 TIMEOUT at 4h, 15518733 cancelled at 1:09). That cap is now 300 in
+# ..._block_just_grpo_async_grpo_nemogym_mathcode.yaml, so this config already
+# resolves to 300 -- pinned explicitly here so the continuation cannot drift if that
+# shared parent is edited again.
+#
+# WATCH THE LENGTH COLUMN. Response length fell 2288 -> 432 tokens (-81%) while
+# accuracy doubled. That is the same direction as the documented mcqa_rg length
+# collapse (the 12-node diffusion run went 308 -> 12 tokens as zero-advantage groups
+# rose 38% -> 69%), whose root cause is the chat template prefilling an empty
+# <think></think> so there is no reasoning channel and GRPO drives toward the
+# shortest scoring form. Here accuracy is still rising fast, so the shortening is
+# plausibly the model shedding genuine rambling from a 2288-token start. If over the
+# next 200 steps length keeps falling while accuracy flattens, that is the collapse
+# and more steps will not fix it -- the prefill has to change.
+#
+# RESUME MECHANICS. The submit wrapper sets checkpointing.checkpoint_dir to
+# ${RUNDIR}/checkpoints, so these legs MUST reuse RUN_NAME=mcqa_rg_ar_8b_8t8g to
+# land in the same run dir and pick up step_100. NODES must stay 16 (8 training +
+# 8 generation): Megatron distributed-optimizer checkpoints do not reshard across
+# DP widths. TP 8 / SP true are inherited, as is the TP>=4 requirement that
+# train_micro_batch_size == logprob_batch_size (both 2).
+defaults: "nemotron_labs_diffusion_8b_vllm_ar_async_grpo_nemogym_mcqa_rg_8t8g.yaml"
+
+grpo:
+  max_num_steps: 300
+
+policy:
+  megatron_cfg:
+    scheduler:
+      # Raising max_num_steps changes the scheduler's total-iteration count, which
+      # Megatron stores in the checkpoint and asserts against on resume. step_100 was
+      # written under the 100-step cap, so a plain resume at 300 dies with:
+      #   AssertionError: OptimizerParamScheduler: class input value <3x> and
+      #   checkpoint value <1x> for total number of weight decay iterations do not match
+      # These two flags take the schedule from THIS config and ignore the
+      # checkpoint's. They are mutually exclusive -- optimizer_param_scheduler.py:175
+      # asserts NOT use_checkpoint when override is set, and Bridge re-checks at
+      # config.py:536.
+      #
+      # This replaces the ENTIRE scheduler state, not just the iteration count. Safe
+      # here because lr_decay_style is constant and lr_warmup_iters is 13, so by step
+      # 100 the LR has long been flat at 3e-07 and there is no curve position to lose.
+      # On a cosine or WSD schedule this would silently reposition the model.
+      override_opt_param_scheduler: true
+      use_checkpoint_opt_param_scheduler: false
+
+logger:
+  wandb:
+    name: "nd8b_vllm_ar_async_grpo_nemogym_mcqa_rg_8t8g_cont"

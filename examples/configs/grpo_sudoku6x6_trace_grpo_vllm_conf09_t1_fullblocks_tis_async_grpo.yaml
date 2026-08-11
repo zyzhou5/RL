@@ -25,15 +25,15 @@
 # recorded logprobs are scored under diffusion_config.temperature.
 #
 # max_denoising_steps MUST rise to canvas_length. The threshold path
-# (nemotron_dllm.py:431) commits every masked position clearing the bar PLUS a
+# (nemotron_dllm.py:446) commits every masked position clearing the bar PLUS a
 # forced top-1, so its floor is one token per step -- and convergence is
-# `masks_left == 0 | step >= max_denoising_steps` (nemotron_dllm.py:513), with no
+# `masks_left == 0 | step >= max_denoising_steps` (nemotron_dllm.py:542), with no
 # flush of what is left. At 8 steps a stalled 16-wide canvas is therefore declared
 # converged with 8 MASK tokens still in it, which is exactly the state entropy
 # creep drives toward. 16 steps makes a complete decode unconditional.
 #
 # COST. `confidence` is the UNTEMPERED softmax probability of the SAMPLED token
-# (nemotron_dllm.py:394-407) -- temperature perturbs which token is drawn, not the
+# (nemotron_dllm.py:409-415) -- temperature perturbs which token is drawn, not the
 # scale it is judged on. At temperature 1.0 a token drawn off the mode routinely
 # misses 0.9, so past the early high-confidence positions only the forced top-1
 # commits. num_levels, which is what Trace pays forward passes for and is

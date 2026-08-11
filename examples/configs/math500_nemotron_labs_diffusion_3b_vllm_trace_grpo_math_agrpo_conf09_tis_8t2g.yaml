@@ -19,7 +19,7 @@
 #   confidence_threshold  null   -> 0.9
 #   temperature           0.6    -> 1.0    (both keys; vllm_worker.py:639 asserts)
 #   max_denoising_steps   8      -> 16     (threshold mode has no flush at the
-#                                           step cap -- nemotron_dllm.py:513)
+#                                           step cap -- nemotron_dllm.py:542)
 #
 # CONFOUND STILL PRESENT. This inherits reference_policy_kl_penalty 0.01 from the
 # math trace chain, whereas the AR run it is being compared against used 0.0. A

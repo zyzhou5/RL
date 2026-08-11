@@ -1,0 +1,102 @@
+# AR GRPO on the math_with_judge NeMo-Gym surface, 3B, 16K sequence budget
+# (8K prompt + 8K generation), vLLM + async-GRPO. 10 nodes = 2 training + 8 generation.
+#
+# Matched to the 8B BlockJustGRPO run on this surface
+# (nemotron_labs_diffusion_8b_vllm_block_just_grpo_async_grpo_nemogym_math_16k.yaml):
+# same data, same env, same 16K budget, same 960 = 120 x 8 global batch. An 8B AR
+# partner on this surface has not been built yet; when it is, it should reuse these
+# numbers so 3B vs 8B stays a clean read.
+#
+# There is no 3B math_with_judge config to inherit (the math_16k chain is 8B via v30),
+# so this starts from the 3B AR mcqa_rg
+# config -- which already carries the 3B checkpoint, the AR policy conversion and the
+# working vLLM + NeMo-Gym + async-GRPO seam -- and swaps the Gym surface and sequence
+# budget over to math_with_judge. The AR keys (worker_cls_fqn, diffusion_config null,
+# hf_overrides.architectures, vllm_val_dllm_overrides null) are all inherited.
+#
+# env is restated IN FULL with _override_: true. The mcqa_rg parent launches the mcqa
+# and reasoning_gym servers and carries their per-server override groups; `_override_`
+# only works on a TOP-LEVEL key, so a partial edit would leave those servers configured.
+# This block is the math_16k one verbatim except return_entropy, which is off because
+# the entropy channel is a JustGRPO-Fast feature that AR does not consume.
+#
+# BATCH. Aligned to the 8B math_16k run's 120 x 8 = 960 rather than the mcqa_rg
+# chain's 128 x 8 = 1024, so both runs on this surface see identical batches. Divisibility: 2 train nodes x 8 GPU
+# = 16, TP 1 -> dp 16; 960 = 16 x 60; 60 / mb 2 = 30 and 60 / logprob_bs 4 = 15.
+#
+# SEQUENCE BUDGET 8192 -> 16384 is not optional on this surface. The data is the same
+# 8K-prompt split the 8B run uses, and an over-long prompt on the NeMo-Gym path does
+# not degrade gracefully -- max_input_seq_length is inert there, so the request kills
+# the AsyncTrajectoryCollector and the rollout buffer stalls permanently instead of
+# marking the sample loss_multiplier 0. activation_checkpointing is turned on to pay
+# for the doubled sequence at TP 1.
+#
+# max_input_seq_length is set to 8192 for documentation only; it has no effect on the
+# Gym path. It is raised from the inherited 4096 so it cannot mislead if that gap is
+# ever closed.
+#
+# Submit: NODES=10, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
+#   NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_792ab07/bin/python-compat
+#   RUN_SCRIPT=examples/nemo_gym/run_grpo_nemo_gym.py, UV_EXTRAS="mcore nemo_gym",
+#   NEMO_GYM_VENV_DIR=.../gym_venvs
+defaults: "nemotron_labs_diffusion_3b_vllm_ar_async_grpo_nemogym_mcqa_rg_2t8g.yaml"
+
+cluster:
+  num_nodes: 10                      # 2 training + 8 generation
+
+grpo:
+  max_num_steps: 500                 # matches the 8B math_16k run (mcqa chain default was 300)
+  num_prompts_per_step: 120
+  num_generations_per_prompt: 8
+
+policy:
+  train_global_batch_size: 960       # 120 x 8, matches the 8B math_16k run
+  max_total_sequence_length: 16384   # 8K prompt + 8K generation
+
+  megatron_cfg:
+    activation_checkpointing: true   # pays for the doubled sequence at TP 1
+
+  generation:
+    max_new_tokens: 8192             # was 4096 on mcqa_rg
+
+data:
+  max_input_seq_length: 8192         # inert on the Gym path; kept honest
+  train:
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_math_with_judge/train.jsonl"
+  validation:
+    data_path: "/lustre/fsw/portfolios/coreai/users/snorouzi/diffusion_rl/dataset/v30_math_with_judge/val.jsonl"
+    repeat: 4                        # avg@4 over 256 prompts = 1024 generations
+
+# Full replacement -- see the note above on why this cannot be a partial edit.
+env:
+  _override_: true
+  math:
+    num_workers: 8
+    math_verify_impl: hf_math_verify
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    uv_venv_dir: "/lustre/fsw/portfolios/coreai/users/snorouzi/gym_venvs"
+    uv_cache_dir: "/lustre/fsw/portfolios/coreai/users/snorouzi/gym_cache/uv"
+    skip_venv_if_present: true
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          should_use_judge: false    # local math_verify, no 235B judge server
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          num_workers: 8
+          return_entropy: false      # JustGRPO-Fast channel; AR does not use it
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-ar-nemogym-math-16k-vllm-async-grpo-2t8g"
+
+logger:
+  log_dir: "logs/grpo-nd3b-ar-nemogym-math-16k-vllm-async-grpo-2t8g"
+  wandb:
+    project: "diffusion_rl"
+    name: "nd3b_vllm_ar_async_grpo_nemogym_math_16k_2t8g"

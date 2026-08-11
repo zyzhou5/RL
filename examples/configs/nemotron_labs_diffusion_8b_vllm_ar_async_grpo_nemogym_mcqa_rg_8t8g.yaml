@@ -1,0 +1,65 @@
+# AR GRPO on the mcqa + reasoning_gym surface at 8B, vLLM generation, async-GRPO,
+# 16 nodes = 8 training + 8 generation.
+#
+# 8B counterpart of nemotron_labs_diffusion_3b_vllm_ar_async_grpo_nemogym_mcqa_rg_2t8g.yaml:
+# the data, envs, AR selection and sequence budget are inherited from that config;
+# this file swaps in the 8B checkpoint and the parallelism the 8B runs use.
+#
+# PARALLELISM. TP 8 + sequence_parallel, matching the proven 8B configs
+# (..._nemogym_v30.yaml, ..._nemogym_math_16k.yaml). CP is deliberately 1: those
+# configs use CP 2 only because they run seq 49152 / 16384, whereas this surface is
+# seq 8192. With TP 8 each node holds one model replica, so dp = train nodes = 8 and
+# train_global_batch_size 1024 -> 128 per rank -> 64 microbatches of 2.
+#
+# TOPOLOGY. 8 generation nodes because AR is generation-bound: the 3B mcqa_rg run
+# spent 49.7s of an 87.8s step in exposed_generation (57%), and 8B decoding at
+# max_new_tokens 4096 is slower still. Training gets 8 nodes because TP 8 forces one
+# replica per node and dp 8 is the minimum that keeps the per-rank batch sane.
+#
+# UNVALIDATED -- run the toy first:
+#  1. AR selection (diffusion_config null + hf_overrides architectures) has only been
+#     exercised at 3B. It requires the grpo.py fix that MERGES hf_overrides; without
+#     it the run is silently served as masked-canvas diffusion at temperature 0.
+#  2. AR + sequence_parallel is a new combination. The diffusion provider had a
+#     scatter_embedding_sequence_parallel issue inherited from its VL parent; the AR
+#     path through the same provider has not been checked with SP on.
+#
+# Submit: NODES=16, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
+#         RUN_SCRIPT=examples/nemo_gym/run_grpo_nemo_gym.py, UV_EXTRAS="mcore nemo_gym",
+#         NEMO_GYM_VENV_DIR=..., NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_792ab07/bin/python-compat
+defaults: "nemotron_labs_diffusion_3b_vllm_ar_async_grpo_nemogym_mcqa_rg_2t8g.yaml"
+
+policy:
+  model_name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-8B-v1.5-sft"
+  tokenizer:
+    name: "/lustre/fsw/portfolios/coreai/users/snorouzi/checkpoints/Nemotron-Labs-Diffusion-8B-v1.5-sft"
+
+  # TP >= 4 requires train_micro_batch_size == logprob_batch_size
+  # (lm_policy.py:170 -- "known batch-variant accuracy issue with TP>=4 for both
+  # DTensor and Megatron backend"). The 3B parent runs mb 2 / logprob_bs 4, which
+  # is fine at TP 1 but rejected here, so pin logprob_bs to the micro-batch.
+  train_micro_batch_size: 2
+  logprob_batch_size: 2
+
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    sequence_parallel: true
+    context_parallel_size: 1
+    activation_checkpointing: true
+
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 8
+        num_nodes: 8       # 8 generation nodes; cluster.num_nodes - 8 train
+
+cluster:
+  num_nodes: 16            # 8 training + 8 generation -> dp 8, 128 per rank
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd8b-ar-mcqa_rg-vllm-async-grpo-8t8g"
+
+logger:
+  log_dir: "logs/grpo-nd8b-ar-mcqa_rg-vllm-async-grpo-8t8g"
+  wandb:
+    name: "grpo-nd8b-ar-mcqa_rg-vllm-async-grpo-8t8g"
