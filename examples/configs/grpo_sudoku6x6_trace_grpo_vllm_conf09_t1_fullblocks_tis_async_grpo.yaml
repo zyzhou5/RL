@@ -1,0 +1,70 @@
+# TraceGRPO, 6x6 Sudoku, vLLM, CONFIDENCE-THRESHOLD unmasking WITH the TIS clamp.
+#
+# Child of the random+TIS async-GRPO config, so the async-GRPO machinery
+# (max_trajectory_age_steps 1, 8 training + 1 generation node) and the TIS clamp
+# (tis @ 2.0, no min bound) are inherited unchanged. ONLY the decode policy moves
+# from the random schedule back to the FastDiffuser confidence protocol.
+#
+# WHY. The one prior confidence run (trace_dsr_icepop0812_conf_t1) collapsed, and
+# the diagnosis was entropy creep walking into the confidence-0.9 decode cliff --
+# but that run carried NO TIS clamp, so "confidence unmasking" and "unclamped
+# importance weights" changed together and were never separated. This config pins
+# the confidence protocol at exactly its prior settings (threshold 0.9,
+# temperature 1.0) and adds the clamp the surviving random runs use, which makes
+# the clamp the single variable.
+#
+# Decode overrides vs the random parent:
+#   selection_policy      random -> confidence_threshold
+#   confidence_threshold  (null) -> 0.9
+#   temperature           0.6    -> 1.0
+#   max_denoising_steps   8      -> 16
+#
+# temperature is set in BOTH policy.generation.temperature and the engine's
+# diffusion_config.temperature: vllm_worker.py:639 raises on any disagreement
+# above 1e-6, because the engine samples at the engine-wide value while the
+# recorded logprobs are scored under diffusion_config.temperature.
+#
+# max_denoising_steps MUST rise to canvas_length. The threshold path
+# (nemotron_dllm.py:431) commits every masked position clearing the bar PLUS a
+# forced top-1, so its floor is one token per step -- and convergence is
+# `masks_left == 0 | step >= max_denoising_steps` (nemotron_dllm.py:513), with no
+# flush of what is left. At 8 steps a stalled 16-wide canvas is therefore declared
+# converged with 8 MASK tokens still in it, which is exactly the state entropy
+# creep drives toward. 16 steps makes a complete decode unconditional.
+#
+# COST. `confidence` is the UNTEMPERED softmax probability of the SAMPLED token
+# (nemotron_dllm.py:394-407) -- temperature perturbs which token is drawn, not the
+# scale it is judged on. At temperature 1.0 a token drawn off the mode routinely
+# misses 0.9, so past the early high-confidence positions only the forced top-1
+# commits. num_levels, which is what Trace pays forward passes for and is
+# all_reduce(MAX)'d across ranks, therefore drifts toward 16 instead of the random
+# schedule's fixed 8. Budget up to 2x the random run's per-step training term.
+#
+# Validation decode is deliberately NOT touched: every sudoku Trace run inherits
+# vllm_val_dllm_overrides = confidence_threshold 0.9 / temperature 1.0 from
+# grpo_sudoku6x6_trace_grpo_vllm.yaml, so val curves stay directly comparable to
+# the random and leftmost runs even though this one now rolls out that way too.
+#
+# Submit: NODES=9, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_reveal_steps/bin/python-compat
+defaults: "grpo_sudoku6x6_trace_grpo_vllm_random_t06_k2_fullblocks_tis_async_grpo.yaml"
+
+policy:
+  generation:
+    temperature: 1.0
+    vllm_kwargs:
+      diffusion_config:
+        temperature: 1.0
+        selection_policy: "confidence_threshold"
+        confidence_threshold: 0.9
+        # Raised from the parent's 8; see the max_denoising_steps note above.
+        max_denoising_steps: 16
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-conf09-t1-sud6x6-fb-tis20-vllm-async-grpo"
+  save_period: 10
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-conf09-t1-sud6x6-fb-tis20-vllm-async-grpo"
+  wandb:
+    name: "trace_sud6x6_conf09_t1_fb_tis20_vllm_async_grpo"

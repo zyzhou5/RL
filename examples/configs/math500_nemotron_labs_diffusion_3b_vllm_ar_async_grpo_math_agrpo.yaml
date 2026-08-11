@@ -1,6 +1,6 @@
 # AR GRPO on the AGRPO-matched MATH train set, vLLM generation, async-GRPO + TIS,
 # 4 nodes (2 training + 2 generation). Head-to-head partner of
-# deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_math_agrpo.yaml:
+# math500_nemotron_labs_diffusion_3b_vllm_trace_grpo_math_agrpo.yaml:
 # same data, same topology, same async-GRPO + TIS stack, only the decode and
 # algorithm differ.
 #

@@ -1,0 +1,62 @@
+# TraceGRPO on the AGRPO-matched MATH train set, vLLM, CONFIDENCE-THRESHOLD
+# unmasking WITH the TIS clamp. 10 nodes = 8 training + 2 generation.
+#
+# Child of the random+TIS 8t2g config, so the dataset (math_train_agrpo_exact),
+# the MATH-500 validation split, the async-GRPO settings, the TIS clamp
+# (tis @ 2.0, no min bound) and the 8-train/2-gen topology are all inherited
+# unchanged. ONLY the decode policy moves from the random schedule back to the
+# FastDiffuser confidence protocol. This is the sudoku config's counterpart --
+# see grpo_sudoku6x6_trace_grpo_vllm_conf09_t1_fullblocks_tis_async_grpo.yaml for
+# the full rationale; the mechanics are identical.
+#
+# WHY HERE SPECIFICALLY. The random+TIS 8t2g run is the one that went flat:
+# MATH-500 0.7500 -> 0.7640 across 20 validations over ~200 steps, every point
+# inside 0.7400-0.7800, while AR on the identical data went 0.7460 -> 0.8500.
+# Decode policy is one of the few untested axes left on that surface.
+#
+# Decode overrides vs the random parent:
+#   selection_policy      random -> confidence_threshold
+#   confidence_threshold  null   -> 0.9
+#   temperature           0.6    -> 1.0    (both keys; vllm_worker.py:639 asserts)
+#   max_denoising_steps   8      -> 16     (threshold mode has no flush at the
+#                                           step cap -- nemotron_dllm.py:513)
+#
+# CONFOUND STILL PRESENT. This inherits reference_policy_kl_penalty 0.01 from the
+# math trace chain, whereas the AR run it is being compared against used 0.0. A
+# KL anchor suppresses movement away from the reference policy, which is one
+# reading of the flat random curve. If the goal is to explain that flatness
+# rather than to test the decode policy, change the KL instead of (not alongside)
+# the selection policy.
+#
+# COST. Trace pays forward passes per reveal level, and at temperature 1.0 the
+# threshold rarely clears past the forced top-1, so num_levels drifts toward 16
+# against the random schedule's fixed 8. The random 8t2g run measured 118s/step;
+# treat ~2x its training term as the upper bound here.
+#
+# train_global_batch_size 1024 stays divisible by dp = 8*8 = 64 -> 16 per rank.
+# NOT a continuation of any random run -- decode policy aside, Megatron
+# distributed-optimizer checkpoints do not reshard across DP widths.
+#
+# Submit: NODES=10, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_reveal_steps/bin/python-compat
+defaults: "math500_nemotron_labs_diffusion_3b_vllm_trace_grpo_math_agrpo_8t2g.yaml"
+
+policy:
+  generation:
+    temperature: 1.0
+    vllm_kwargs:
+      diffusion_config:
+        temperature: 1.0
+        selection_policy: "confidence_threshold"
+        confidence_threshold: 0.9
+        # Raised from the parent's 8 so a stalled canvas cannot be emitted with
+        # MASK tokens still in it.
+        max_denoising_steps: 16
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-math_agrpo-vllm-conf09-tis-async-8t2g"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-math_agrpo-vllm-conf09-tis-async-8t2g"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-math_agrpo-vllm-conf09-tis-async-8t2g"

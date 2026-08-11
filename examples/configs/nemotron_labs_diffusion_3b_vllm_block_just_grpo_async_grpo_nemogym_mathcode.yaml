@@ -35,7 +35,13 @@ cluster:
 grpo:
   num_prompts_per_step: 128
   num_generations_per_prompt: 8
-  max_num_steps: 100
+  # 100 -> 300. Every NeMo-Gym config inherits this file (mathcode -> mcqa_rg ->
+  # the AR variants), and 100 was cutting runs off mid-climb: the 8B AR mcqa_rg run
+  # was still gaining ~3 points per 10 steps when it hit the cap.
+  # NOTE: resuming a checkpoint trained under the old cap needs the scheduler
+  # override flags (Megatron stores total-iteration count in the checkpoint and
+  # asserts on it) -- see ..._mcqa_rg_12n_cont.yaml for the pattern.
+  max_num_steps: 300
   val_period: 10
   max_val_samples: null              # REQUIRED null on the nemo_gym path
 
