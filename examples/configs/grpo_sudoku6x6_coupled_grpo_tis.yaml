@@ -1,0 +1,28 @@
+# CoupledGRPO 6x6 with truncated importance sampling (TIS) ENABLED. Inherits the standard
+# coupled 6x6 config and only turns the off-policy correction on: the PG term is reweighted
+# by clamp(exp(prev - generation), max=2.0) so mismatched behaviour samples cannot dominate
+# an update.
+#
+# The behaviour logprob on this path is SGLang's final_step reveal logprob (set by the
+# coupled bs16 parent via coupled_confidence_dllm_bs16.yaml). Tokens committed before their
+# block's last denoising step carry a +1 sentinel instead of a real logprob; ClippedPGLoss
+# falls back to prev at those positions (weight 1.0), so only real final-step positions are
+# corrected. Metrics to read: `is_oob_ratio` (fraction of tokens whose weight hit the 2.0
+# clamp) and `sampling_importance_ratio` (mean weight -- far from 1.0 means the behaviour
+# and coupled estimates disagree), alongside the matched `gen_kl_error` that
+# `verify_gen_kl_with_sglang_mask` already logs.
+defaults: "grpo_sudoku6x6_coupled_grpo.yaml"
+
+loss_fn:
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: "tis"      # clamp weights to [0, ratio]
+  truncated_importance_sampling_ratio: 2.0       # same bound as the AR / Trace tis configs
+  truncated_importance_sampling_ratio_min: null  # icepop-only lower bound; unused by "tis"
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-coupled_grpo-sudoku6x6-tis-megatron"
+
+logger:
+  log_dir: "logs/grpo-nd3b-coupled_grpo-sudoku6x6-tis-sglang"
+  wandb:
+    name: "grpo-nd3b-coupled_grpo-sudoku6x6-tis2p0"

@@ -1,0 +1,40 @@
+# Random-order TraceGRPO on the AGRPO-matched MATH train set, vLLM, async-GRPO + TIS,
+# 10 nodes = 8 TRAINING + 2 generation.
+#
+# Re-topology of the 4n (2 train + 2 gen) run, which was badly mis-split for this
+# algorithm. Measured there at 411.6s/step:
+#     policy_training                251.5s (61%)
+#     policy_and_reference_logprobs  157.6s (38%)
+#     exposed_generation               0.9s ( 0.2%)   <- 2 whole gen nodes idle
+# Trace is training-bound (num_levels=8 forward passes per sequence, plus a
+# reference-policy pass for the KL term), while async-GRPO keeps the rollout
+# buffer full with almost no generation pressure. Moving 6 nodes from generation
+# to training targets the actual bottleneck: DP 16 -> 64.
+#
+# NOT a continuation of the 4n run: Megatron distributed-optimizer checkpoints do
+# not reshard across DP widths, so a DP 16 -> 64 resume fails with a global shape
+# mismatch. Starting fresh costs little here -- the 4n run reached only step 30
+# with MATH-500 0.7360 -> 0.7480, i.e. noise.
+#
+# train_global_batch_size 1024 must stay divisible by dp = 8*8 = 64 -> 16 per rank.
+# Submit: NODES=10, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_reveal_steps/bin/python-compat
+defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_math_agrpo.yaml"
+
+policy:
+  generation:
+    colocated:
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2     # 2 generation nodes; cluster.num_nodes - 2 train
+
+cluster:
+  num_nodes: 10          # 8 training + 2 generation -> dp 64, 16 per rank
+
+checkpointing:
+  checkpoint_dir: "results/grpo-nd3b-trace_grpo-math_agrpo-vllm-random-tis-async-8t2g"
+
+logger:
+  log_dir: "logs/grpo-nd3b-trace_grpo-math_agrpo-vllm-random-tis-async-8t2g"
+  wandb:
+    name: "grpo-nd3b-trace_grpo-math_agrpo-vllm-random-tis-async-8t2g"
