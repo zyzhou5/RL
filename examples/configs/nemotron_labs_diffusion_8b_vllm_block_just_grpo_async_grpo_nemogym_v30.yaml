@@ -14,14 +14,14 @@
 defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_block_just_grpo_async_grpo_megatron.yaml"
 
 cluster:
-  num_nodes: 15                      # 12 train + 3 gen (run-specific; see policy.generation.colocated.resources)
+  num_nodes: 20                      # 16 train + 4 gen (run-specific; see policy.generation.colocated.resources)
 
 grpo:
   val_period: 10                     # every 10 steps (~1 per 4h window at ~16min/step); base inherits 10
   max_val_samples: null              # REQUIRED null on the nemo_gym path (base sets 2000)
   num_prompts_per_step: 120          # base inherits 128
   num_generations_per_prompt: 8
-  max_num_steps: 50                  # short prod run (base inherits 5000)
+  max_num_steps: 300                 # was 50 (short prod run); 300 matches the AR v30 baseline horizon (base inherits 5000)
 
 policy:
   # NOTE: base config is 3B; this run uses the 8B v1.5-sft checkpoint (model_name below).
@@ -44,12 +44,24 @@ policy:
       http_server_serving_chat_kwargs:
         enable_auto_tools: true
         tool_parser: step3p5
+        # The chat template opens the reasoning block IN THE PROMPT
+        # (...<|im_start|>assistant\n<think>\n), so every generation begins with a
+        # bare </think>. With reasoning_parser unset, that lands in the response
+        # text handed to the resource-server graders. structured_outputs does
+        # json.loads(response_text) with no stripping (app.py: parse_content), so
+        # it dies on the first character and returns 0.0 for EVERY sample --
+        # measured 144/144 zeros (AR) and 120/120 zeros (BJG-Fast), i.e. the agent
+        # is structurally incapable of scoring, independent of policy.
+        # Step3p5ReasoningParser matches this model's <think>/</think> convention
+        # and scans backwards for the last tag, so it handles the opening tag
+        # coming from the prompt rather than the model.
+        reasoning_parser: step3p5
     vllm_kwargs:
       diffusion_config:
         return_entropy: true   # ENGINE-side (JustGRPO-Fast): model emits per-token entropy as a 2nd logprob column keyed by mask_token_id. vllm_kwargs is a SIBLING of vllm_cfg (what the engine reads via vllm_worker.py:149); deep-merges with parent vllm_kwargs.diffusion_config (canvas_length/selection_policy/temperature).
     colocated:
       resources:
-        num_nodes: 3                 # 3 gen nodes (12 train + 3 gen = 15; run-specific)
+        num_nodes: 4                 # 4 gen nodes (16 train + 4 gen = 20; run-specific). DP = 16x8/(TP8xCP2) = 8; tgbs 960/8 = 120 per rank
   # 48k sequence sharded TP=8 x CP=2 (block-JustGRPO CP path; allow_unpacked required
   # for the asymmetric attention). sequence_parallel ON now that SP+CP is supported
   # (step-40 prod ran SP off; re-enabled here -- worth a smoke check).
