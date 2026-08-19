@@ -249,11 +249,13 @@ def _deep_update(base: dict[str, Any], overrides: dict[str, Any]) -> dict[str, A
 _VAL_GROUP_BACKENDS: dict[str, dict[str, str]] = {
     "sglang": {
         "overrides_key": "sglang_val_dllm_overrides",
+        "variants_key": "sglang_val_dllm_variants",
         "engine_cfg_key": "sglang_cfg",
         "name_prefix": "sglang_val",
     },
     "vllm": {
         "overrides_key": "vllm_val_dllm_overrides",
+        "variants_key": "vllm_val_dllm_variants",
         "engine_cfg_key": "vllm_cfg",
         "name_prefix": "vllm_val",
     },
@@ -2804,6 +2806,19 @@ def validate(
             master_config["grpo"]["max_val_samples"]
             // master_config["grpo"]["val_batch_size"]
         )
+        if max_batches < 1:
+            # Previously this surfaced as an UnboundLocalError deeper in the
+            # function; the pass helper below tolerates it, so say plainly that
+            # the resulting accuracy is vacuous rather than reporting 0.0 as if
+            # it were measured.
+            print(
+                f"  ⚠️ grpo.max_val_samples "
+                f"({master_config['grpo']['max_val_samples']}) is smaller than "
+                f"grpo.val_batch_size ({master_config['grpo']['val_batch_size']}), "
+                f"so NO validation batches will run and reported accuracy is "
+                f"meaningless. Raise max_val_samples to at least val_batch_size.",
+                flush=True,
+            )
         # Optionally switch the generation engine to a fixed decoding policy for
         # validation so val curves are comparable across runs that roll out with
         # different policies (e.g. leftmost vs confidence). Supported by the
@@ -2820,28 +2835,58 @@ def validate(
         val_dllm_overrides = (
             gen_cfg.get(val_spec["overrides_key"]) if val_spec is not None else None
         )
-        restore_dllm_overrides = None
-        # Overrides carrying the backend's engine-config key describe a dedicated
-        # validation engine group (already launched with them baked in), not
-        # runtime decode knobs — never feed those to reconfigure_dllm.
-        if val_dllm_overrides and not _val_overrides_need_server_group(
-            val_dllm_overrides, val_backend
-        ):
-            restore_dllm_overrides = policy_generation.reconfigure_dllm(
-                val_dllm_overrides
-            )
-            print(
-                f"  ↪ validation decoding overrides applied: {val_dllm_overrides} "
-                f"(will restore: {restore_dllm_overrides})",
-                flush=True,
-            )
-        pending_exc = None
-        try:
+        # Decode variants to validate under. `<backend>_val_dllm_variants` maps a
+        # name to that variant's soft decode knobs, so one validation cycle can
+        # report several decodes side by side -- e.g. the rollout decode next to
+        # a sequential (one-token-per-step) reference. On a diffusion LLM the
+        # sampler is part of the policy, so a single curve cannot separate "the
+        # weights degraded" from "the sampler stopped working on these weights";
+        # two curves can.
+        #
+        # Every variant sweeps the same prompts with the same batch budget, so
+        # their accuracies are directly comparable. The FIRST variant is the
+        # primary: it additionally fills the unsuffixed accuracy/avg_length
+        # (which feed checkpoint selection) and owns the printed samples and the
+        # val_data jsonl. Absent => the legacy single-decode behavior driven by
+        # `<backend>_val_dllm_overrides`.
+        val_variants: list[tuple[str, Any]] = []
+        variants_cfg = (
+            gen_cfg.get(val_spec["variants_key"]) if val_spec is not None else None
+        )
+        if variants_cfg:
+            for variant_name, variant_knobs in variants_cfg.items():
+                assert not _val_overrides_need_server_group(
+                    variant_knobs, val_backend
+                ), (
+                    f"validation variant '{variant_name}' contains the engine-config "
+                    f"key for backend '{val_backend}'; variants are runtime decode "
+                    f"knobs applied via reconfigure_dllm and cannot change "
+                    f"engine-launch settings (use the dedicated validation engine "
+                    f"group, i.e. {val_spec['overrides_key']}, for those)."
+                )
+                val_variants.append((variant_name, variant_knobs))
+        else:
+            val_variants.append(("", val_dllm_overrides))
+
+        def _run_val_pass():
+            """Run one validation sweep under the CURRENTLY configured decode.
+
+            Factored out so each decode variant (see
+            `<backend>_val_dllm_variants`) can run the same sweep without
+            duplicating the rollout dispatch. All accumulators are local; the
+            caller decides what to keep. The dataloader is re-iterated from the
+            start, so every variant sees the same prompts and their metrics are
+            paired rather than independently sampled.
+            """
+            pass_rewards: list = []
+            pass_lengths: list = []
+            pass_msg_logs: list = []
+            pass_extra: dict = {}
             for batch_idx, val_batch in enumerate(val_dataloader):
                 if batch_idx >= max_batches:
                     break
 
-                additional_metrics_to_report = dict()
+                pass_extra = {}
                 # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
                 # Use async rollouts if vLLM async engine is enabled
                 # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
@@ -2864,7 +2909,7 @@ def validate(
                     )
                     val_batch = nemo_gym_rollout_result.final_batch
                     gen_metrics = nemo_gym_rollout_result.rollout_metrics
-                    additional_metrics_to_report = gen_metrics
+                    pass_extra = gen_metrics
                 elif _should_use_async_rollouts(master_config):
                     val_batch, gen_metrics = run_async_multi_turn_rollout(
                         policy_generation,
@@ -2886,8 +2931,8 @@ def validate(
                         greedy=False,
                     )
 
-                total_rewards.extend(val_batch["total_reward"].tolist())
-                total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+                pass_rewards.extend(val_batch["total_reward"].tolist())
+                pass_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
                 # Collect message logs for later display
                 to_env = [
@@ -2897,30 +2942,92 @@ def validate(
                     for i in range(len(val_batch["message_log"]))
                 ]
 
-                all_message_logs.extend(to_env)
+                pass_msg_logs.extend(to_env)
+            return pass_rewards, pass_lengths, pass_msg_logs, pass_extra
 
-        except Exception as e:
-            # Remember an in-flight validation error so the restore step below can
-            # avoid masking it (see finally).
-            pending_exc = e
-            raise
-        finally:
-            # Always restore the rollout decoding config. If restoration fails we
-            # must NOT silently continue -- leaving the engine on the validation
-            # policy would corrupt subsequent rollouts -- so fail loud. But never
-            # mask an exception already propagating from the validation loop.
-            if restore_dllm_overrides:
-                try:
-                    policy_generation.reconfigure_dllm(restore_dllm_overrides)
-                except Exception as restore_exc:
+        variant_metrics: dict[str, float] = {}
+        additional_metrics_to_report: dict = {}
+        for variant_idx, (variant_name, variant_knobs) in enumerate(val_variants):
+            is_primary = variant_idx == 0
+            restore_dllm_overrides = None
+            pending_exc = None
+            try:
+                # Knobs carrying the backend's engine-config key describe a
+                # dedicated validation engine group (already launched with them
+                # baked in), not runtime decode knobs -- never feed those to
+                # reconfigure_dllm.
+                if variant_knobs and not _val_overrides_need_server_group(
+                    variant_knobs, val_backend
+                ):
+                    restore_dllm_overrides = policy_generation.reconfigure_dllm(
+                        variant_knobs
+                    )
+                    if restore_dllm_overrides is None and not is_primary:
+                        print(
+                            f"  ⚠️ Validation variant '{variant_name}' skipped: "
+                            f"this generation backend does not support runtime "
+                            f"decode reconfiguration, so it would duplicate the "
+                            f"primary decode.",
+                            flush=True,
+                        )
+                        continue
                     print(
-                        f"  ❌ Failed to restore rollout decoding config after "
-                        f"validation (engine may be left on the validation "
-                        f"policy): {restore_exc}",
+                        f"  ↪ validation decode "
+                        f"'{variant_name or 'primary'}': {variant_knobs} "
+                        f"(will restore: {restore_dllm_overrides})",
                         flush=True,
                     )
-                    if pending_exc is None:
-                        raise
+                (
+                    v_rewards,
+                    v_lengths,
+                    v_msg_logs,
+                    v_extra,
+                ) = _run_val_pass()
+            except Exception as e:
+                # Remember an in-flight error so the restore below can avoid
+                # masking it (see finally).
+                pending_exc = e
+                if is_primary:
+                    raise
+                # A secondary variant is a diagnostic: never let it take down a
+                # training run.
+                print(
+                    f"  ⚠️ Validation variant '{variant_name}' failed and was "
+                    f"skipped: {e}",
+                    flush=True,
+                )
+                continue
+            finally:
+                # Always restore the rollout decoding config. Leaving the engine
+                # on a validation policy would corrupt every subsequent rollout,
+                # so a failed restore is fatal -- except when it would mask an
+                # exception already propagating out of the primary variant.
+                if restore_dllm_overrides:
+                    try:
+                        policy_generation.reconfigure_dllm(restore_dllm_overrides)
+                    except Exception as restore_exc:
+                        print(
+                            f"  ❌ Failed to restore rollout decoding config after "
+                            f"validation (engine may be left on the validation "
+                            f"policy): {restore_exc}",
+                            flush=True,
+                        )
+                        if pending_exc is None or not is_primary:
+                            raise
+            if is_primary:
+                total_rewards.extend(v_rewards)
+                total_lengths.extend(v_lengths)
+                all_message_logs.extend(v_msg_logs)
+                additional_metrics_to_report = v_extra
+            if variant_name:
+                if v_rewards:
+                    variant_metrics[f"accuracy/{variant_name}"] = (
+                        torch.tensor(v_rewards, dtype=torch.float32).mean().item()
+                    )
+                if v_lengths:
+                    variant_metrics[f"avg_length/{variant_name}"] = sum(
+                        v_lengths
+                    ) / len(v_lengths)
 
         # Calculate validation metrics
         num_samples = len(total_rewards)
@@ -2938,6 +3045,7 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
             **additional_metrics_to_report,
+            **variant_metrics,
         }
 
         # Print sample conversations only once at the end of validation

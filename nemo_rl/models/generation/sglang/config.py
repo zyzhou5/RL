@@ -144,3 +144,33 @@ class SGLangConfig(GenerationConfig):
     #
     # Absent/None => validation uses the same decoding as rollout.
     sglang_val_dllm_overrides: NotRequired[dict[str, Any] | None]
+
+    # Named decode variants to validate under, reported side by side as
+    # "val:accuracy/<name>" / "val:avg_length/<name>". Each entry holds that
+    # variant's soft decode knobs (same vocabulary as mode 1 above).
+    #
+    # Every variant sweeps the SAME prompts with the same budget
+    # (grpo.max_val_samples // grpo.val_batch_size batches), so their
+    # accuracies are directly comparable. The FIRST entry is the primary: it
+    # also fills the unsuffixed val:accuracy (which drives checkpoint
+    # selection) and owns the printed samples and val_data jsonl.
+    #
+    # Motivation: on a diffusion LLM the sampler is part of the policy, so a
+    # single val curve cannot separate "the weights degraded" from "the
+    # sampler stopped working on these weights". Validating the rollout
+    # decode alongside a sequential (one-token-per-step) reference answers
+    # that -- if the sequential curve holds while the parallel one falls,
+    # the damage is in the sampler, not the model:
+    #      sglang_val_dllm_variants:
+    #        rollout: {...the rollout decode...}
+    #        seq_k1:
+    #          selection_policy: confidence
+    #          threshold: 1.5      # k = max(1, #{conf >= thr}) => 1
+    #          max_steps: 16       # >= block_size, else the tail is
+    #                              # force-committed at the last forward
+    #
+    # Variants may not contain the engine-config key (they are applied via
+    # reconfigure_dllm, which cannot change engine-launch settings); use
+    # sglang_val_dllm_overrides for that. When absent, validation falls back
+    # to the single decode from sglang_val_dllm_overrides.
+    sglang_val_dllm_variants: NotRequired[dict[str, Any] | None]
