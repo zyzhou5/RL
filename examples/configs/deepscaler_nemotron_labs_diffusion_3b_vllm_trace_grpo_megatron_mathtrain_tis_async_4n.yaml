@@ -12,7 +12,7 @@
 # (mirrors the DeepScaleR async topology, not sudoku's single gen node);
 # watch buffer_filled_ratio and add a gen node if the collector starves.
 # Submit: NODES=4, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
-#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_reveal_steps/bin/python-compat
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_792ab07/bin/python-compat
 defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_megatron_mathtrain.yaml"
 
 grpo:

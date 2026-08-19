@@ -9,7 +9,7 @@ defaults: "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron_icep
 policy:
   generation:
     sglang_cfg:
-      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_fullblocks.yaml"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/trace_fastdiffuser_bs16_fullblocks.yaml"
 
 checkpointing:
   checkpoint_dir: "results/grpo-nd3b-trace_grpo-conf09-fullblocks-deepscaler-icepop0812-megatron"

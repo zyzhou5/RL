@@ -22,7 +22,7 @@ policy:
   generation:
     sglang_cfg:
       shared_position_seed: true
-      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_conf_filtered_thr06_k2.yaml"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/trace_fastdiffuser_bs16_conf_filtered_thr06_k2.yaml"
 
 checkpointing:
   checkpoint_dir: "results/grpo-nd3b-trace_grpo-conf-filtered-thr06-k2-deepscaler-icepop0812-megatron"

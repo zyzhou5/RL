@@ -18,7 +18,7 @@
 #
 # train_global_batch_size 1024 must stay divisible by dp = 8*8 = 64 -> 16 per rank.
 # Submit: NODES=10, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
-#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_reveal_steps/bin/python-compat
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_792ab07/bin/python-compat
 defaults: "math500_nemotron_labs_diffusion_3b_vllm_trace_grpo_math_agrpo.yaml"
 
 policy:

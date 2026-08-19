@@ -8,7 +8,7 @@
 # confidence async run (both share async-GRPO + TIS ratio 2.0).
 # Node math identical: 2 train + 2 gen -> DP 16, batch 1024 (64/rank).
 # Submit: NODES=4, ENV_TAG=mb_3rdparty_vllm_local_fork_fixed,
-#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_reveal_steps/bin/python-compat
+#         NRL_VLLM_PY_EXECUTABLE=.../nemotron_dllm_792ab07/bin/python-compat
 defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_megatron_mathtrain_random.yaml"
 
 grpo:

@@ -60,7 +60,7 @@ policy:
       # Random-order unmasking at temperature 0.6 (max_steps 8, k=2 tok/step),
       # logprob_mode: trajectory so SGLang records each token's block-relative
       # commit_step (output_token_reveal_steps).
-      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_random_t06_k2.yaml"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/trace_fastdiffuser_bs16_random_t06_k2.yaml"
 
 checkpointing:
   checkpoint_dir: "results/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-megatron"

@@ -90,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("sglang", "vllm"), default="sglang")
     parser.add_argument(
         "--vllm-python",
-        default="/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_reveal_steps/bin/python-compat",
+        default="/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_792ab07/bin/python-compat",
     )
 
     parser.add_argument("--max-new-tokens", type=int, default=750)

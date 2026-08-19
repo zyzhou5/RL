@@ -8,7 +8,7 @@ defaults: "grpo_sudoku6x6_trace_grpo_random_t06.yaml"
 policy:
   generation:
     sglang_cfg:
-      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16_random_t06_k2_eosblockend.yaml"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/trace_fastdiffuser_bs16_random_t06_k2_eosblockend.yaml"
 
 checkpointing:
   checkpoint_dir: "results/grpo-nd3b-trace_grpo-random-t06-sudoku6x6-eosblockend-megatron"

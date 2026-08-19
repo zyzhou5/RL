@@ -7,7 +7,7 @@
 # from there. This file only shrinks the run.
 #
 # Requires the reveal-steps vLLM runtime (return_reveal_steps, inherited):
-#   NRL_VLLM_PY_EXECUTABLE=/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_reveal_steps/bin/python-compat
+#   NRL_VLLM_PY_EXECUTABLE=/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_792ab07/bin/python-compat
 defaults: "deepscaler_nemotron_labs_diffusion_3b_vllm_trace_grpo_megatron_mathtrain.yaml"
 
 cluster:

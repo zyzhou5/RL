@@ -41,7 +41,7 @@ policy:
     sglang_cfg:
       # Confidence decoding with logprob_mode: trajectory so SGLang records and
       # returns each token's block-relative commit_step (output_token_reveal_steps).
-      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL-Trace/tools/nemotron_diffusion/trace_fastdiffuser_bs16.yaml"
+      dllm_algorithm_config: "/home/snorouzi/diffusion_RL/RL/tools/nemotron_diffusion/trace_fastdiffuser_bs16.yaml"
 
 checkpointing:
   checkpoint_dir: "results/grpo-nemotron-diffusion-3b-trace-grpo-deepscaler-megatron"

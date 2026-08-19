@@ -14,7 +14,7 @@
 # shared with the block runs.
 #
 # Requires the reveal-steps vLLM runtime:
-#   NRL_VLLM_PY_EXECUTABLE=/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_reveal_steps/bin/python-compat
+#   NRL_VLLM_PY_EXECUTABLE=/lustre/fsw/portfolios/coreai/users/snorouzi/vllm_runtimes/nemotron_dllm_792ab07/bin/python-compat
 # Submit with NODES=16 (matches the inherited cluster.num_nodes: 16).
 defaults:
   - "deepscaler_nemotron_labs_diffusion_3b_sglang_trace_grpo_megatron.yaml"
