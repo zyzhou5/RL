@@ -14,5 +14,5 @@ fi
 MEGATRON_PATCH_DIR="${MEGATRON_PATCH_DIR_PREFIX}${MEGATRON_PATCH_DIR:-/home/snorouzi/code/Megatron-Bridge/src:/lustre/fsw/portfolios/coreai/users/snorouzi/hf_home/modules}" \
 STEP_DIR="${STEP_DIR:?STEP_DIR is required}" \
 OUT="${OUT:?OUT is required}" \
-BASE_MODEL=/lustre/fsw/portfolios/coreai/users/snorouzi/hf_home/hub/models--nvidia--Nemotron-Diffusion-Exp-Ministral-3B-Instruct/snapshots/d7c52fbc82c29932c18a02478da6e93921daad34 \
+BASE_MODEL="${BASE_MODEL:-/lustre/fsw/portfolios/coreai/users/snorouzi/hf_home/hub/models--nvidia--Nemotron-Diffusion-Exp-Ministral-3B-Instruct/snapshots/d7c52fbc82c29932c18a02478da6e93921daad34}" \
 tools/nemotron_diffusion/convert_nemotron_diffusion_checkpoint_to_hf.sh
