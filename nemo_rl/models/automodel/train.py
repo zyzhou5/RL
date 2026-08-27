@@ -86,6 +86,14 @@ def model_forward(
         use_cache=False,
     )
 
+    reserved_model_kwargs = processed_inputs.model_kwargs.keys() & model_args.keys()
+    if reserved_model_kwargs:
+        raise ValueError(
+            "ProcessedInputs.model_kwargs cannot override core model arguments: "
+            f"{sorted(reserved_model_kwargs)}"
+        )
+    model_args.update(processed_inputs.model_kwargs)
+
     # Add flash attention kwargs if applicable
     if processed_inputs.has_flash_attention:
         model_args["flash_attn_kwargs"] = processed_inputs.flash_attn_kwargs

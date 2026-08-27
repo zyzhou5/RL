@@ -773,6 +773,7 @@ class TestSetupDistributed:
         assert fsdp2_call_kwargs["sequence_parallel"] is False
         assert fsdp2_call_kwargs["activation_checkpointing"] is False
         assert fsdp2_call_kwargs["backend"] == "nccl"
+        assert fsdp2_call_kwargs["mp_policy"].cast_forward_inputs is True
 
         # Verify create_device_mesh was called with correct size params
         mesh_call_kwargs = mock_create_mesh.call_args[1]

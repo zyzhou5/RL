@@ -441,6 +441,13 @@ def setup_distributed(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
             output_dtype=torch.float32,
+            # Keep inputs to recursively sharded transformer blocks aligned
+            # with their compute parameters. In particular, HF rotary
+            # embeddings may be produced by an unsharded FP32 root module;
+            # leaving them in FP32 promotes BF16 Q/K while V remains BF16,
+            # which fused attention rejects. This also matches AutoModel's
+            # default FSDP2 mixed-precision policy.
+            cast_forward_inputs=True,
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["dtensor_cfg"]["activation_checkpointing"],

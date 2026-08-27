@@ -1,0 +1,56 @@
+# BlockJustGRPO-Fast, 6x6 Sudoku, SGLang, SINGLE NODE (1x8 GPUs).
+#
+# Why this file exists: no 1-node Fast config ships with the fork.
+#   - `..._toy_8p8g_fast.yaml`  is Fast but inherits cluster 16x8 / max_new_tokens 3744
+#   - `..._toy_8p8g_1n.yaml`    is 1 node / 512 tokens but NOT Fast
+# They cannot simply be combined in one `defaults:` list, because the loader fully
+# resolves each parent before merging, so the Fast parent's num_nodes=16 wins. This
+# child therefore inherits the 1-node config and re-adds only the Fast knobs.
+#
+# Dataset: sudoku6x6 is generated locally by
+# nemo_rl/data/datasets/response_datasets/sudoku6x6_generator.py -- no HF download,
+# so the job needs no outbound network at runtime.
+#
+# THREE PLACES block_size MUST AGREE (a mismatch does not error; it silently
+# produces a wrong objective -- the fork records gen_kl 1.41 from exactly this):
+#   1. policy.hf_config_overrides.block_size .............. 16  (inherited)
+#   2. dllm_algorithm_config -> ..._bs16_entropy.yaml ..... block_size: 16, max_steps: 16
+#   3. policy.logprob_estimation.block_size ............... OMITTED, so it inherits (1)
+#   + policy.generation.max_new_tokens must be a multiple of 16 (512 is)
+#
+# Fast requires per-token entropy from the generation engine. Only the SGLang fork
+# TIP (restore/a652eb48-good-run @ c02140e) emits `output_token_entropy_val`; the
+# commit the fork's pyproject originally pinned (a652eb48) has no entropy code at
+# all, so BlockJustGRPO-Fast is impossible on it. If the channel is missing the run
+# fail-fasts at require_generation_entropy rather than silently sparsifying on zeros.
+defaults:
+  - "deepscaler_nemotron_labs_diffusion_3b_sglang_block_just_grpo_megatron_toy_8p8g_1n.yaml"
+  - "grpo_sudoku6x6_base.yaml"
+
+policy:
+  logprob_estimation:
+    # m = ceil(0.25 * 16) = 4 reveal levels / forward passes instead of 16.
+    fast_entropy_level_ratio: 0.25
+  generation:
+    max_new_tokens: 512   # multiple of block_size 16
+    sglang_cfg:
+      # In-repo relative path. The shipped configs point into /home/snorouzi/... ,
+      # which is unreadable to us; the identical file is tracked here.
+      dllm_algorithm_config: "tools/nemotron_diffusion/block_just_grpo_leftmost_dllm_bs16_entropy.yaml"
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
+
+grpo:
+  max_num_steps: 2
+  val_at_start: false
+  val_at_end: false
+
+# Compatibility probe, not an experiment: no checkpoints, no W&B.
+checkpointing:
+  enabled: false
+
+logger:
+  wandb_enabled: false
+  log_dir: "logs/bjgf-sudoku6x6-1n"

@@ -1,0 +1,89 @@
+# BlockJustGRPO-Fast on 6x6 Sudoku, 1 node x 8 GPUs, AUTOMODEL (DTensor) backend.
+#
+# Backend-swapped sibling of grpo_sudoku6x6_block_just_grpo_fast_1n.yaml, which runs
+# the same algorithm on Megatron and is the parity target (that config reached
+# reward 0.110 -> 0.307 over 30 steps at gen-KL ~1.8e-3).
+#
+# Everything above the policy worker is inherited unchanged: the GRPO loop, the
+# dataloader, the reasoning_gym environment, advantages, and the SGLang FastDiffuser
+# generation path. Only the trainer differs.
+defaults: "grpo_sudoku6x6_block_just_grpo_fast_1n.yaml"
+
+policy:
+  # --- the backend swap -----------------------------------------------------
+  worker_cls_fqn: "nemo_rl.models.policy.workers.block_just_grpo_dtensor_policy_worker.BlockJustGRPODTensorPolicyWorker"
+
+  megatron_cfg:
+    enabled: false
+
+  dtensor_cfg:
+    enabled: true
+    _v2: true                    # NOT the code default; selects the Automodel worker
+    tensor_parallel_size: 1
+    context_parallel_size: 1     # CP is unsupported on this path -- see the worker's guard
+    automodel_kwargs:
+      # NLD is loaded through its HF remote-code implementation. AutoModel still
+      # supplies FSDP2/optimizer/refit around that model.
+      force_hf: true
+    # The Megatron run had activation checkpointing ON. Fast runs 4 reveal-level
+    # forwards per step over a 2x-length [noisy|clean] input, so memory pressure is
+    # higher here than for an ordinary LLM. Turn on if it OOMs.
+    activation_checkpointing: false
+
+  # Automodel builds its optimizer from policy.optimizer; the Megatron recipes set
+  # this to null and configure megatron_cfg.optimizer instead. The two schemas are
+  # NOT 1:1, so this has to be restated rather than translated mechanically.
+  optimizer:
+    name: "torch.optim.AdamW"
+    kwargs:
+      lr: 3.0e-7
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      # Required for DTensor/FSDP parameters; these match the stock AutoModel
+      # GRPO recipe rather than inheriting Megatron's fused optimizer path.
+      foreach: false
+      fused: false
+
+  # The Megatron parent sets policy.scheduler=null because mcore owns scheduling.
+  # AutoModel owns it here. Match the Megatron recipe's 13-step warmup from
+  # 3e-8 to 3e-7, followed by a constant learning rate.
+  scheduler:
+    - name: "torch.optim.lr_scheduler.LinearLR"
+      kwargs:
+        start_factor: 0.1
+        end_factor: 1.0
+        total_iters: 13
+    - name: "torch.optim.lr_scheduler.ConstantLR"
+      kwargs:
+        factor: 1.0
+        total_iters: 10000000000
+    - milestones: [13]
+
+  # --- the model ------------------------------------------------------------
+  # Patched clone: weights symlinked, code fixed for transformers 5.3.0, and
+  # auto_map extended with AutoModelForCausalLM. See run/patch_checkpoint.py.
+  model_name: "/lustre/fsw/portfolios/coreai/users/zezhou/dev/diffusionllm/dllm-rl-integration/build/checkpoints/Nemotron-Labs-Diffusion-3B"
+
+  hf_config_overrides:
+    block_size: 16
+    # CRITICAL, and verified on hardware. MinistralDiffEncoderModel.__init__ picks
+    # its attention class from dlm_paradigm:
+    #     block_diff / sbd_block_diff  -> MinistralFlexAttention (asymmetric mask)
+    #     bidirectional / autoregressive -> plain causal attention
+    # The checkpoint ships 'autoregressive'. Without this override the run trains
+    # happily on ORDINARY CAUSAL ATTENTION and is silently wrong. The worker also
+    # asserts this at startup.
+    dlm_paradigm: "sbd_block_diff"
+
+  # Packing keeps documents apart via cu_seqlens because attention is causal;
+  # bidirectional attention inside a packed buffer leaks across boundaries.
+  sequence_packing:
+    enabled: false
+
+checkpointing:
+  enabled: false
+
+logger:
+  wandb_enabled: false
+  log_dir: "logs/bjgf-sudoku6x6-1n-automodel"

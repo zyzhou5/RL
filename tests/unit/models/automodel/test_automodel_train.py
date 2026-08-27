@@ -203,6 +203,23 @@ class TestModelForward:
         call_kwargs = mock_model.call_args[1]
         assert "flash_attn_kwargs" not in call_kwargs
 
+    def test_forward_passes_model_specific_kwargs(
+        self, mock_model, processed_inputs_no_flash
+    ):
+        processed_inputs_no_flash.model_kwargs["block_size"] = 16
+
+        model_forward(mock_model, processed_inputs_no_flash)
+
+        assert mock_model.call_args.kwargs["block_size"] == 16
+
+    def test_forward_rejects_core_argument_override(
+        self, mock_model, processed_inputs_no_flash
+    ):
+        processed_inputs_no_flash.model_kwargs["input_ids"] = torch.zeros(1, 1)
+
+        with pytest.raises(ValueError, match="cannot override core model arguments"):
+            model_forward(mock_model, processed_inputs_no_flash)
+
 
 # =====================
 # Test extract_logits
