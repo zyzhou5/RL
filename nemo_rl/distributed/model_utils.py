@@ -13,18 +13,15 @@
 # limitations under the License.
 
 from collections.abc import Sequence
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from megatron.core.models.gpt import GPTModel
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_context_parallel_world_size,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-)
-from megatron.core.utils import deprecate_inference_params, get_pg_size
 from torch.distributed.tensor import DTensor, distribute_tensor
+
+if TYPE_CHECKING:
+    # megatron-core (optional "mcore" extra) is imported lazily inside the
+    # functions below so this module imports without mcore installed.
+    from megatron.core.models.gpt import GPTModel
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -1071,12 +1068,20 @@ def from_parallel_logits_to_same_position_logprobs(
         )
 
     batch_size, seq_len, _ = vocab_parallel_logits.shape
-    target_positions = target_positions.to(device=vocab_parallel_logits.device, dtype=torch.long)
-    target_tokens = target_tokens.to(device=vocab_parallel_logits.device, dtype=torch.long)
+    target_positions = target_positions.to(
+        device=vocab_parallel_logits.device, dtype=torch.long
+    )
+    target_tokens = target_tokens.to(
+        device=vocab_parallel_logits.device, dtype=torch.long
+    )
     if torch.any((target_positions < 0) | (target_positions >= seq_len)):
-        raise ValueError(f"target_positions must be in [0, {seq_len}), got {target_positions}")
+        raise ValueError(
+            f"target_positions must be in [0, {seq_len}), got {target_positions}"
+        )
 
-    gather_positions = (target_positions + int(position_shift)).clamp(min=0, max=seq_len - 1)
+    gather_positions = (target_positions + int(position_shift)).clamp(
+        min=0, max=seq_len - 1
+    )
     row_indices = torch.arange(batch_size, device=vocab_parallel_logits.device)
     selected_logits = vocab_parallel_logits[row_indices, gather_positions, :]
     if (
@@ -1313,6 +1318,11 @@ def gather_cp_sharded_logits(output_tensor: torch.Tensor) -> torch.Tensor:
     logits are reconstructed (seq_dim=1) first. No-op when cp_size <= 1. Shared
     by the JustGRPO and DiffuGRPO Megatron post-processors.
     """
+    from megatron.core.parallel_state import (
+        get_context_parallel_group,
+        get_context_parallel_world_size,
+    )
+
     cp_size = get_context_parallel_world_size()
     if cp_size <= 1:
         return output_tensor
@@ -2166,6 +2176,8 @@ class ChunkedDistributedHiddenStatesToLogprobs(torch.autograd.Function):
 
 
 def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
+    from megatron.core.models.gpt import GPTModel
+
     if getattr(GPTModel, "_linear_ce_fusion_forward_patched", False):
         GPTModel._linear_ce_fusion_chunk_size = chunk_size
         return
@@ -2176,7 +2188,7 @@ def patch_gpt_model_forward_for_linear_ce_fusion(*, chunk_size: int) -> None:
 
 
 def _gpt_forward_with_linear_ce_fusion(
-    self: GPTModel,
+    self: "GPTModel",
     input_ids: torch.Tensor,
     position_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -2192,6 +2204,12 @@ def _gpt_forward_with_linear_ce_fusion(
     padding_mask: Optional[torch.Tensor] = None,
     return_logprobs_for_linear_ce_fusion: bool = False,
 ) -> torch.Tensor:
+    from megatron.core.parallel_state import (
+        get_tensor_model_parallel_group,
+        get_tensor_model_parallel_rank,
+    )
+    from megatron.core.utils import deprecate_inference_params, get_pg_size
+
     if not return_logprobs_for_linear_ce_fusion:
         return self._original_forward_for_linear_ce_fusion(
             input_ids=input_ids,

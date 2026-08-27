@@ -51,6 +51,11 @@ class ProcessedInputs:
     # Multimodal (VLM) inputs
     vlm_kwargs: dict[str, Any] = field(default_factory=dict)
 
+    # Optional model-specific arguments. This is deliberately separate from
+    # ``vlm_kwargs``: diffusion language models, for example, need to pass the
+    # denoising block size without pretending the input is multimodal.
+    model_kwargs: dict[str, Any] = field(default_factory=dict)
+
     # Context parallel support (cp_size > 1)
     cp_buffers: list[torch.Tensor] = field(default_factory=list)
     seq_index: Optional[torch.Tensor] = None
