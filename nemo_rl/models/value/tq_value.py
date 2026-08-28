@@ -73,6 +73,7 @@ class TQValue(TQDriverMixin, Value):
                 f"TP/PP/CP sizes."
             )
         self.dp_cfg = dp_cfg
+        self._data_plane_shutdown_blocked = False
         self.dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
         ray.get(
             self.worker_group.run_all_workers_single_data(
@@ -83,12 +84,32 @@ class TQValue(TQDriverMixin, Value):
     # ── lifecycle ──────────────────────────────────────────────────────
 
     def shutdown(self) -> bool:  # type: ignore[override]
-        """Close the TQ client before shutting down the worker group."""
+        """Shut down workers before closing this attached TQ client."""
+        if getattr(self, "_data_plane_shutdown_blocked", False):
+            return False
+
+        try:
+            workers_stopped = super().shutdown()
+        except BaseException:
+            self._data_plane_shutdown_blocked = True
+            raise
+        if not workers_stopped:
+            # Value workers remain attached to the trainer-owned TQ controller.
+            # Keep this facade alive until their process-local clients are closed.
+            self._data_plane_shutdown_blocked = True
+            warnings.warn(
+                "Value workers did not shut down; preserving the attached "
+                "data-plane client",
+                RuntimeWarning,
+            )
+            return False
+
         try:
             self.dp_client.close()
         except Exception as e:
-            warnings.warn(f"Error closing data-plane client: {e}")
-        return super().shutdown()
+            warnings.warn(f"Error closing data-plane client: {e}", RuntimeWarning)
+            return False
+        return True
 
     # ── 1-hop entrypoints (KVBatchMeta in, no re-fan-out) ──────────────────
 

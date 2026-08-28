@@ -86,7 +86,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
-from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.async_utils import call_data_plane, drain_task_until_done
 from nemo_rl.data_plane.schema import DP_CALIB_INPUT_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
@@ -345,29 +345,32 @@ class SingleControllerActor:
 
     async def run(self) -> dict[str, Any]:
         """Main entry point. Runs until max_train_steps is reached."""
-        # Synchronize weights before starting the pumps
-        await self._sync_weights()
-        self._rollout_manager.set_weight_version(self._trainer_version)
-
-        await self._maybe_restore_replay_buffer()
-        await self._maybe_restore_replacement_reserve()
-
-        # Start the rollout and train pumps, plus the watchdog
-        rollout_task = asyncio.create_task(self._rollout_pump())
-        train_task = asyncio.create_task(self._train_pump())
-        watchdog_task = asyncio.create_task(self._stall_watchdog_pump())
-        tasks = [rollout_task, train_task, watchdog_task]
-        # Only with fleet health on. Created unconditionally it would be a timer firing
-        # every probe_interval_s for every run that does not use the feature, which is
-        # the default.
-        probe_task = (
-            asyncio.create_task(self._gen_fleet_probe_pump())
-            if self._gen_fleet is not None
-            else None
-        )
-        if probe_task is not None:
-            tasks.append(probe_task)
+        tasks: list[asyncio.Task[Any]] = []
+        run_completed = False
         try:
+            # Synchronize weights before starting the pumps.
+            await self._sync_weights()
+            self._rollout_manager.set_weight_version(self._trainer_version)
+
+            await self._maybe_restore_replay_buffer()
+            await self._maybe_restore_replacement_reserve()
+
+            # Start the rollout and train pumps, plus the watchdog.
+            rollout_task = asyncio.create_task(self._rollout_pump())
+            train_task = asyncio.create_task(self._train_pump())
+            watchdog_task = asyncio.create_task(self._stall_watchdog_pump())
+            tasks = [rollout_task, train_task, watchdog_task]
+            # Only with fleet health on. Created unconditionally it would be a timer
+            # firing every probe_interval_s for every run that does not use the
+            # feature, which is the default.
+            probe_task = (
+                asyncio.create_task(self._gen_fleet_probe_pump())
+                if self._gen_fleet is not None
+                else None
+            )
+            if probe_task is not None:
+                tasks.append(probe_task)
+
             done, _ = await asyncio.wait(
                 set(tasks), return_when=asyncio.FIRST_COMPLETED
             )
@@ -384,22 +387,66 @@ class SingleControllerActor:
                 # rollout pump leaves the train pump to drain committed groups.
                 await rollout_task
             await train_task
+
+            result = {
+                "train_steps": self._train_steps,
+                "trainer_version": self._trainer_version,
+            }
+            run_completed = True
+            return result
         finally:
+            cleanup_errors: list[tuple[str, BaseException]] = []
+            cancellation_deferred = False
+
+            def record_cleanup_error(name: str, error: BaseException) -> None:
+                cleanup_errors.append((name, error))
+
+            async def run_thread_cleanup(name: str, callback: Any) -> None:
+                nonlocal cancellation_deferred
+                cleanup_task = asyncio.create_task(
+                    asyncio.to_thread(callback),
+                    name=f"single-controller-{name}-shutdown",
+                )
+                cancellation_deferred |= await drain_task_until_done(cleanup_task)
+                try:
+                    cleanup_task.result()
+                except BaseException as error:
+                    record_cleanup_error(name, error)
+
             for task in tasks:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            task_drain = asyncio.gather(*tasks, return_exceptions=True)
+            cancellation_deferred |= await drain_task_until_done(task_drain)
             try:
                 self._weight_synchronizer.shutdown()
-            except Exception as e:  # teardown must not mask the original failure
-                print(f"Error during weight-synchronizer shutdown: {e}", flush=True)
-            finally:
+            except BaseException as error:
+                record_cleanup_error("weight-synchronizer", error)
+            try:
                 self._logger.finish()
-                await asyncio.to_thread(self._checkpointer.shutdown)
+            except BaseException as error:
+                record_cleanup_error("logger", error)
+            await run_thread_cleanup("checkpointer", self._checkpointer.shutdown)
+            close_data_plane = getattr(self._dp_client, "close", None)
+            if callable(close_data_plane):
+                # The client was reconstructed in this Ray process, so its
+                # process-local TQ/Mooncake resources must be closed here too.
+                await run_thread_cleanup("data-plane", close_data_plane)
 
-        return {
-            "train_steps": self._train_steps,
-            "trainer_version": self._trainer_version,
-        }
+            if run_completed and cleanup_errors:
+                # A successful training body is not a successful run when final
+                # checkpoint/data-plane cleanup failed. Raise the first cleanup
+                # failure and report any later ones without replacing it.
+                for name, error in cleanup_errors[1:]:
+                    print(f"Error during {name} shutdown: {error}", flush=True)
+                raise cleanup_errors[0][1]
+            if not run_completed:
+                # Preserve the pump failure or cancellation already unwinding.
+                for name, error in cleanup_errors:
+                    print(f"Error during {name} shutdown: {error}", flush=True)
+            elif cancellation_deferred:
+                # Cancellation received during otherwise-successful cleanup was
+                # deferred so every process-local resource could finish safely.
+                raise asyncio.CancelledError
 
     async def ping(self) -> dict[str, Any]:
         """Liveness check — returns immediately if event loop is running."""
@@ -644,6 +691,9 @@ class SingleControllerActor:
             metadata["replay_group_count"] = len(replay_metadata["groups"])
         started = time.monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
+        # call_data_plane's offloaded path repeatedly shields and drains the
+        # synchronous save. Even repeated pump cancellation therefore cannot
+        # let run() close the process-local TQ client while this call uses it.
         try:
             await call_data_plane(
                 self._dp_client,

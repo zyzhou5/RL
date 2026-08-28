@@ -17,6 +17,8 @@
 import asyncio
 import threading
 
+import pytest
+
 from nemo_rl.data_plane.async_utils import call_data_plane
 
 
@@ -58,6 +60,84 @@ def test_sync_call_can_be_offloaded() -> None:
     )
 
     assert result != caller_thread_id
+
+
+def test_cancelled_offload_drains_worker_thread_before_propagating() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class _BlockingClient:
+        def mutate(self) -> None:
+            started.set()
+            try:
+                assert release.wait(timeout=30.0), "test never released mutation"
+            finally:
+                finished.set()
+
+    async def _main() -> tuple[bool, bool]:
+        task = asyncio.create_task(
+            call_data_plane(_BlockingClient(), "mutate", offload_sync=True)
+        )
+        assert await asyncio.to_thread(started.wait, 30.0)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        done_before_release = task.done()
+        finished_before_release = finished.is_set()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return done_before_release, finished_before_release
+
+    try:
+        done_before_release, finished_before_release = asyncio.run(_main())
+    finally:
+        release.set()
+
+    assert not done_before_release
+    assert not finished_before_release
+    assert finished.is_set()
+
+
+def test_repeated_cancellation_cannot_detach_offloaded_worker_thread() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    class _BlockingClient:
+        def mutate(self) -> None:
+            started.set()
+            try:
+                assert release.wait(timeout=30.0), "test never released mutation"
+            finally:
+                finished.set()
+
+    async def _main() -> tuple[bool, bool]:
+        task = asyncio.create_task(
+            call_data_plane(_BlockingClient(), "mutate", offload_sync=True)
+        )
+        assert await asyncio.to_thread(started.wait, 30.0)
+
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        done_before_release = task.done()
+        finished_before_release = finished.is_set()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return done_before_release, finished_before_release
+
+    try:
+        done_before_release, finished_before_release = asyncio.run(_main())
+    finally:
+        release.set()
+
+    assert not done_before_release
+    assert not finished_before_release
+    assert finished.is_set()
 
 
 def test_local_coroutine_result_is_awaited() -> None:

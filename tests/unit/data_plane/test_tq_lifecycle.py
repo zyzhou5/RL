@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
+import pickle
 from typing import Callable
 from unittest.mock import MagicMock
 
@@ -100,6 +102,385 @@ _DATA_OPERATION_INVOKERS: dict[str, Callable[[DataPlaneClient], None]] = {
     "clear_samples": _clear_samples,
 }
 _LIFECYCLE_METHODS = {"save_checkpoint", "load_checkpoint", "close"}
+
+
+def test_deserialization_reconstructs_process_local_client_before_connect(
+    monkeypatch,
+) -> None:
+    """Ray must install this process's TQ plugin before attaching its client."""
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    events: list[str] = []
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "")
+    monkeypatch.setattr(
+        tq_adapter,
+        "_patch_mooncake_register_check",
+        lambda: events.append("register-check"),
+    )
+    monkeypatch.setattr(
+        tq_adapter,
+        "_patch_mooncake_staging_buffers",
+        lambda _size: events.append("staging-buffers"),
+    )
+    monkeypatch.setattr(
+        tq_adapter,
+        "install_tq_mooncake_checkpoint_plugin",
+        lambda: events.append("checkpoint-plugin"),
+    )
+    monkeypatch.setattr(
+        tq_adapter,
+        "_connect_existing",
+        lambda: events.append("connect"),
+    )
+
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+    }
+    source = object.__new__(tq_adapter.TQDataPlaneClient)
+    source._cfg = cfg
+
+    restored = pickle.loads(pickle.dumps(source))
+
+    assert events == [
+        "register-check",
+        "staging-buffers",
+        "checkpoint-plugin",
+        "connect",
+    ]
+    assert restored._cfg == cfg
+    assert restored._owns_tq_system is False
+    assert restored._data_operations_started is False
+    assert restored._closed is False
+
+
+def test_ray_actor_deserialization_installs_plugin_and_preserves_controller(
+    tq_client,
+) -> None:
+    """Exercise the real cloudpickle boundary in a dedicated Ray actor process."""
+    import ray
+
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "mooncake_cpu",
+        "claim_meta_poll_interval_s": 0.5,
+    }
+    source = object.__new__(tq_adapter.TQDataPlaneClient)
+    source._cfg = cfg
+
+    @ray.remote(num_cpus=0)
+    class _DeserializationProbe:
+        def __init__(self, client) -> None:
+            self.client = client
+
+        def inspect_and_close(self) -> tuple[int, bool, bool]:
+            from transfer_queue.storage.managers.base import StorageManagerFactory
+
+            manager = StorageManagerFactory._registry["MooncakeStore"]
+            result = (
+                os.getpid(),
+                bool(
+                    getattr(
+                        manager,
+                        "_nemo_rl_mooncake_checkpoint_plugin_v1",
+                        False,
+                    )
+                ),
+                self.client._owns_tq_system,
+            )
+            self.client.close()
+            return result
+
+    probe = _DeserializationProbe.remote(source)
+    actor_pid, plugin_installed, owns_system = ray.get(probe.inspect_and_close.remote())
+
+    assert actor_pid != os.getpid()
+    assert plugin_installed is True
+    assert owns_system is False
+    # A connect-only actor close must not kill the named controller used by
+    # the bootstrap client in this driver process.
+    controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+    assert controller is not None
+    assert tq_client is not None
+
+
+@pytest.mark.parametrize(
+    ("had_bootstrap", "has_bootstrap_after_failure", "expected_cleanup"),
+    [
+        (False, True, "global"),
+        (False, False, "local"),
+        (True, True, "shared-local"),
+    ],
+)
+def test_bootstrap_failure_cleanup_respects_system_ownership(
+    monkeypatch,
+    had_bootstrap: bool,
+    has_bootstrap_after_failure: bool,
+    expected_cleanup: str,
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    events: list[str] = []
+
+    def fail_init(_cfg) -> None:
+        events.append("init")
+        raise RuntimeError("injected bootstrap failure")
+
+    def fail_local_cleanup() -> None:
+        events.append("local-close")
+        raise RuntimeError("cleanup must not replace bootstrap failure")
+
+    monkeypatch.setattr(tq_adapter, "_init_tq", fail_init)
+    monkeypatch.setattr(tq_adapter, "_close_local_tq_client", fail_local_cleanup)
+    monkeypatch.setattr(
+        tq_adapter,
+        "_local_process_owns_tq_bootstrap",
+        MagicMock(side_effect=[had_bootstrap, has_bootstrap_after_failure]),
+    )
+
+    def fail_global_cleanup() -> None:
+        events.append("global-close")
+        raise RuntimeError("cleanup must not replace bootstrap failure")
+
+    global_close = MagicMock(side_effect=fail_global_cleanup)
+    monkeypatch.setattr(tq_adapter.tq, "close", global_close)
+    monkeypatch.setattr(
+        tq_adapter,
+        "stop_tq_mooncake_checkpoint_master",
+        lambda: events.append("master-stop"),
+    )
+
+    with pytest.raises(RuntimeError, match="injected bootstrap failure"):
+        tq_adapter.TQDataPlaneClient(
+            {
+                "enabled": True,
+                "impl": "transfer_queue",
+                "backend": "simple",
+                "claim_meta_poll_interval_s": 0.5,
+            }
+        )
+
+    if expected_cleanup == "global":
+        assert events == ["init", "global-close", "master-stop"]
+        global_close.assert_called_once_with()
+    elif expected_cleanup == "local":
+        assert events == ["init", "local-close"]
+        global_close.assert_not_called()
+    else:
+        assert events == ["init"]
+        global_close.assert_not_called()
+
+
+def test_only_the_facade_that_created_bootstrap_owns_system_cleanup(
+    monkeypatch,
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    process_state = {"has_bootstrap": False}
+
+    def fake_init(_cfg) -> None:
+        process_state["has_bootstrap"] = True
+
+    global_close = MagicMock()
+    local_close = MagicMock()
+    master_stop = MagicMock()
+    monkeypatch.setattr(tq_adapter, "_init_tq", fake_init)
+    monkeypatch.setattr(
+        tq_adapter,
+        "_local_process_owns_tq_bootstrap",
+        lambda: process_state["has_bootstrap"],
+    )
+    monkeypatch.setattr(tq_adapter.tq, "close", global_close)
+    monkeypatch.setattr(tq_adapter, "_close_local_tq_client", local_close)
+    monkeypatch.setattr(
+        tq_adapter,
+        "stop_tq_mooncake_checkpoint_master",
+        master_stop,
+    )
+    cfg = {
+        "enabled": True,
+        "impl": "transfer_queue",
+        "backend": "simple",
+        "claim_meta_poll_interval_s": 0.5,
+    }
+
+    owner = tq_adapter.TQDataPlaneClient(cfg)
+    shared_facade = tq_adapter.TQDataPlaneClient(cfg)
+
+    assert owner._owns_tq_system is True
+    assert shared_facade._owns_tq_system is False
+
+    shared_facade.close()
+    global_close.assert_not_called()
+    local_close.assert_not_called()
+    master_stop.assert_not_called()
+
+    owner.close()
+    global_close.assert_called_once_with()
+    local_close.assert_not_called()
+    master_stop.assert_called_once_with()
+
+
+def test_local_tq_detach_preserves_the_shared_controller(monkeypatch) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    local_client = MagicMock()
+    controller = object()
+    monkeypatch.setattr(tq_adapter.tq_interface, "_TQ_CLIENT", local_client)
+    monkeypatch.setattr(tq_adapter.tq_interface, "_TQ_CONTROLLER", controller)
+
+    tq_adapter._close_local_tq_client()
+
+    local_client.close.assert_called_once_with()
+    assert tq_adapter.tq_interface._TQ_CLIENT is None
+    assert tq_adapter.tq_interface._TQ_CONTROLLER is controller
+
+
+@pytest.mark.parametrize(
+    ("owns_system", "process_has_bootstrap", "expected_route"),
+    [
+        (True, True, "global"),
+        (False, False, "local"),
+        (False, True, "shared-local"),
+    ],
+)
+def test_client_close_routes_by_system_ownership(
+    monkeypatch,
+    owns_system: bool,
+    process_has_bootstrap: bool,
+    expected_route: str,
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    global_close = MagicMock()
+    local_close = MagicMock()
+    master_stop = MagicMock()
+    monkeypatch.setattr(tq_adapter.tq, "close", global_close)
+    monkeypatch.setattr(tq_adapter, "_close_local_tq_client", local_close)
+    monkeypatch.setattr(
+        tq_adapter,
+        "_local_process_owns_tq_bootstrap",
+        lambda: process_has_bootstrap,
+    )
+    monkeypatch.setattr(
+        tq_adapter,
+        "stop_tq_mooncake_checkpoint_master",
+        master_stop,
+    )
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._owns_tq_system = owns_system
+    client._closed = False
+
+    client.close()
+    client.close()
+
+    if expected_route == "global":
+        global_close.assert_called_once_with()
+        local_close.assert_not_called()
+        master_stop.assert_called_once_with()
+    elif expected_route == "local":
+        local_close.assert_called_once_with()
+        global_close.assert_not_called()
+        master_stop.assert_not_called()
+    else:
+        local_close.assert_not_called()
+        global_close.assert_not_called()
+        master_stop.assert_not_called()
+
+
+def test_owner_close_failure_is_visible_and_retryable(monkeypatch) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    global_close = MagicMock(
+        side_effect=[RuntimeError("injected global close failure"), None]
+    )
+    master_stop = MagicMock()
+    monkeypatch.setattr(tq_adapter.tq, "close", global_close)
+    monkeypatch.setattr(
+        tq_adapter,
+        "stop_tq_mooncake_checkpoint_master",
+        master_stop,
+    )
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._owns_tq_system = True
+    client._closed = False
+
+    with pytest.raises(RuntimeError, match="injected global close failure"):
+        client.close()
+
+    assert client._closed is False
+    master_stop.assert_called_once_with()
+
+    client.close()
+    assert client._closed is True
+    assert global_close.call_count == 2
+    assert master_stop.call_count == 2
+
+
+def test_local_detach_failure_is_visible_and_retryable(monkeypatch) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    local_close = MagicMock(
+        side_effect=[RuntimeError("injected local detach failure"), None]
+    )
+    monkeypatch.setattr(tq_adapter, "_close_local_tq_client", local_close)
+    monkeypatch.setattr(
+        tq_adapter,
+        "_local_process_owns_tq_bootstrap",
+        lambda: False,
+    )
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._owns_tq_system = False
+    client._closed = False
+
+    with pytest.raises(RuntimeError, match="injected local detach failure"):
+        client.close()
+
+    assert client._closed is False
+    client.close()
+    assert client._closed is True
+    assert local_close.call_count == 2
+
+
+@pytest.mark.parametrize(
+    ("backend", "supports_checkpointing", "expected_key_batches"),
+    [
+        ("mooncake_cpu", True, [["row-a"], ["row-b"]]),
+        ("mooncake_cpu", False, [["row-a", "row-b"]]),
+        ("simple", True, [["row-a", "row-b"]]),
+    ],
+)
+def test_clear_uses_singletons_only_for_checkpoint_enabled_mooncake(
+    monkeypatch,
+    backend: str,
+    supports_checkpointing: bool,
+    expected_key_batches: list[list[str]],
+) -> None:
+    """Singleton metadata preserves heterogeneous per-row fields and chunks."""
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    clear = MagicMock()
+    monkeypatch.setattr(tq_adapter.tq, "kv_clear", clear)
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._backend = backend
+    client._supports_checkpointing = supports_checkpointing
+    client._data_operations_started = False
+
+    client.clear_samples(["row-a", "row-b"], "rollout_staging")
+
+    assert [call.kwargs["keys"] for call in clear.call_args_list] == (
+        expected_key_batches
+    )
+    assert all(
+        call.kwargs["partition_id"] == "rollout_staging"
+        for call in clear.call_args_list
+    )
+    assert client._data_operations_started is True
 
 
 def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
@@ -216,6 +597,8 @@ def test_each_public_data_operation_marks_the_client_dirty(
     client._warmed_fields = {}
     client._poll_interval_s = 0
     client._promote_1d = False
+    client._backend = "simple"
+    client._supports_checkpointing = True
 
     _DATA_OPERATION_INVOKERS[operation_name](client)
 
@@ -340,6 +723,46 @@ def test_failed_checkpoint_load_leaves_client_in_dirty_state(
 
     connect.assert_called_once_with()
     load.assert_called_once_with(checkpoint_dir)
+
+
+@pytest.mark.parametrize("operation", ["save", "load"])
+def test_checkpoint_lifecycle_rejects_controller_only_checkpoint(
+    monkeypatch,
+    tmp_path,
+    operation: str,
+) -> None:
+    """Never accept TQ's silent ``storage_saved=false`` fallback as durable."""
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    connect = MagicMock()
+    save = MagicMock()
+    load = MagicMock()
+    monkeypatch.setattr(tq_adapter, "_connect_existing", connect)
+    monkeypatch.setattr(tq_adapter.tq, "save_checkpoint", save)
+    monkeypatch.setattr(tq_adapter.tq, "load_checkpoint", load)
+
+    checkpoint_dir = tmp_path / "data-plane"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text(
+        json.dumps({"storage_saved": False, "user_metadata": {"step": 7}})
+    )
+    client = object.__new__(tq_adapter.TQDataPlaneClient)
+    client._backend = "mooncake_cpu"
+    client._supports_checkpointing = True
+    client._data_operations_started = False
+
+    with pytest.raises(RuntimeError, match="storage_saved must be true"):
+        if operation == "save":
+            client.save_checkpoint(checkpoint_dir)
+        else:
+            client.load_checkpoint(checkpoint_dir)
+
+    if operation == "save":
+        connect.assert_called_once_with()
+        save.assert_called_once_with(checkpoint_dir, metadata=None)
+    else:
+        connect.assert_not_called()
+        load.assert_not_called()
 
 
 @pytest.mark.parametrize("operation", ["save", "load"])

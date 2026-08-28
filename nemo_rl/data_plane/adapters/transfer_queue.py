@@ -43,6 +43,7 @@ import torch
 # Loading this loads mooncake, which snapshots MC_* on the way in. Configure the
 # engine before this import — see nemo_rl.data_plane.adapters.transfer_queue_env.
 import transfer_queue as tq
+import transfer_queue.interface as tq_interface
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
@@ -54,6 +55,11 @@ from nemo_rl.data_plane.interfaces import (
     data_plane_supports_checkpointing,
 )
 from nemo_rl.data_plane.schema import PROMOTE_1D_FIELDS
+from nemo_rl.utils.tq_mooncake_checkpoint import (
+    MOONCAKE_CHECKPOINT_SESSION_ENV,
+    install_tq_mooncake_checkpoint_plugin,
+    stop_tq_mooncake_checkpoint_master,
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Backend init — lifted from rl-arena/arena/backends.py.
@@ -529,6 +535,17 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
         # Sizes are per client process and RDMA-pinned — see MooncakeCpuConfig
         # in nemo_rl/data_plane/interfaces.py for the per-node arithmetic.
         mooncake_cfg = backend_config(cfg)
+        checkpoint_config = mooncake_cfg.checkpoint.model_dump()
+        if mooncake_cfg.checkpoint.enabled:
+            session_id = os.environ.get(MOONCAKE_CHECKPOINT_SESSION_ENV)
+            if not session_id:
+                raise RuntimeError(
+                    "Mooncake checkpointing is enabled, but the per-run "
+                    f"{MOONCAKE_CHECKPOINT_SESSION_ENV} was not configured. "
+                    "Call maybe_configure_data_plane_env before importing the "
+                    "TQ adapter or initializing Ray."
+                )
+            checkpoint_config["session_id"] = session_id
         overlay = {
             **controller_overlay,
             "backend": {
@@ -536,11 +553,14 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
                 "MooncakeStore": {
                     "global_segment_size": int(mooncake_cfg.global_segment_size),
                     "local_buffer_size": int(mooncake_cfg.local_buffer_size),
+                    "use_gdr": bool(mooncake_cfg.use_gdr),
+                    "gdr_staging_buffer_mb": int(mooncake_cfg.gdr_staging_buffer_mb),
                     # _init_tq runs on the driver only — driver IS the
                     # head, so local_ip here is also the head's IP that
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:50050",
                     "master_server_address": f"{local_ip}:50051",
+                    "checkpoint": checkpoint_config,
                     **_mooncake_transport_config(),
                 },
             },
@@ -552,6 +572,81 @@ def _init_tq(cfg: DataPlaneConfig) -> None:
 
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
+
+
+def _read_complete_checkpoint_metadata(
+    checkpoint_dir: str | Path,
+) -> dict[str, Any]:
+    """Read TQ metadata and require a completed storage checkpoint.
+
+    TQ catches a backend ``NotImplementedError`` and still writes controller
+    metadata with ``storage_saved=false``. Treating that directory as a valid
+    checkpoint would restore the catalog without its payloads.
+    """
+    metadata_path = Path(checkpoint_dir) / "metadata.json"
+    with metadata_path.open() as metadata_file:
+        checkpoint_metadata = json.load(metadata_file)
+    if not isinstance(checkpoint_metadata, dict):
+        raise ValueError("TQ checkpoint metadata must be a dictionary")
+    if checkpoint_metadata.get("storage_saved") is not True:
+        raise RuntimeError(
+            "TQ checkpoint is incomplete: metadata.json.storage_saved must be true"
+        )
+    return checkpoint_metadata
+
+
+def _close_local_tq_client() -> None:
+    """Detach only this process's TQ client without killing shared actors.
+
+    Pinned TQ's public ``close()`` is a system-wide operation: even a process
+    that only attached to an existing controller will kill the named controller.
+    Worker and Single Controller processes instead close their local client and
+    storage manager directly. The bootstrap owner performs the one eventual
+    system-wide close after driver-side resource shutdown reaches it.
+    """
+    client_attr = next(
+        (
+            name
+            for name in ("_TQ_CLIENT", "_TRANSFER_QUEUE_CLIENT")
+            if hasattr(tq_interface, name)
+        ),
+        None,
+    )
+    if client_attr is None:
+        raise RuntimeError(
+            "TransferQueue client-global name changed; cannot safely perform "
+            "a process-local detach"
+        )
+    client = getattr(tq_interface, client_attr)
+    if client is not None:
+        try:
+            client.close()
+        finally:
+            setattr(tq_interface, client_attr, None)
+
+
+def _local_process_owns_tq_bootstrap() -> bool:
+    """Return whether pinned TQ recorded storage bootstrapping in this process.
+
+    TQ sets this process-local global to an empty dictionary before invoking
+    the backend provider. It therefore distinguishes the process that created
+    the named controller from a process that merely attached, including when
+    provider initialization raises before any storage resource is returned.
+    """
+    storage_attr = next(
+        (
+            name
+            for name in ("_TQ_STORAGE", "_TRANSFER_QUEUE_STORAGE")
+            if hasattr(tq_interface, name)
+        ),
+        None,
+    )
+    if storage_attr is None:
+        raise RuntimeError(
+            "TransferQueue storage-global name changed; cannot determine "
+            "bootstrap ownership safely"
+        )
+    return getattr(tq_interface, storage_attr) is not None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -687,6 +782,12 @@ class TQDataPlaneClient(DataPlaneClient):
                 cluster — ``cfg`` is then only consulted for client-side
                 knobs (poll interval).
         """
+        # Retain only configuration as serialization state. TQ clients and
+        # plugin registries are process-local and must be reconstructed in a
+        # Ray actor rather than copied from the driver.
+        self._cfg = cfg
+        self._owns_tq_system = False
+
         # mooncake_cpu setup must run BEFORE _init_tq / _connect_existing
         # — once tq.init/connect runs, Mooncake's engine.so reads the
         # env vars and they can't be changed. Two per-process knobs are
@@ -722,6 +823,10 @@ class TQDataPlaneClient(DataPlaneClient):
             mooncake_cfg = backend_config(cfg)
             if mooncake_cfg.reuse_registered_buffers:
                 _patch_mooncake_staging_buffers(mooncake_cfg.staging_buffer_size)
+            # TQ registries are process-local. Install the delegating manager
+            # and bootstrap provider before either tq.init path in every
+            # process; disabled configurations preserve upstream behavior.
+            install_tq_mooncake_checkpoint_plugin()
 
         # Workaround for TQ KVStorageManager's 1D-field schema/data
         # mismatch (only `mooncake_cpu` goes through that path; `simple`
@@ -733,7 +838,40 @@ class TQDataPlaneClient(DataPlaneClient):
         self._promote_1d = cfg["backend"] == "mooncake_cpu"
 
         if bootstrap:
-            _init_tq(cfg)
+            # _TQ_STORAGE is process-global and stays populated for the
+            # lifetime of the bootstrap process. Capture its state before
+            # this init call so a second facade in the same process cannot
+            # mistake the first facade's bootstrap for its own.
+            had_bootstrap = _local_process_owns_tq_bootstrap()
+            try:
+                _init_tq(cfg)
+                self._owns_tq_system = (
+                    not had_bootstrap and _local_process_owns_tq_bootstrap()
+                )
+            except Exception:
+                # tq.init may either create the named controller or attach after
+                # losing an initialization race. Its public close is cluster-
+                # global, so per-call ownership must be distinguished before
+                # cleanup. A second facade in the bootstrap process must leave
+                # the shared local client and plugin-owned master untouched.
+                # Pinned TQ's storage-global identifies the creator even when
+                # the provider failed: only that creator may perform cluster-
+                # global cleanup; a process that did not already share the
+                # bootstrap and merely attached detaches locally.
+                created_bootstrap = (
+                    not had_bootstrap and _local_process_owns_tq_bootstrap()
+                )
+                try:
+                    if created_bootstrap:
+                        tq.close()
+                    elif not had_bootstrap:
+                        _close_local_tq_client()
+                except Exception:
+                    pass
+                finally:
+                    if created_bootstrap:
+                        stop_tq_mooncake_checkpoint_master()
+                raise
         else:
             _connect_existing()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
@@ -746,6 +884,23 @@ class TQDataPlaneClient(DataPlaneClient):
         # The controller's field map is append-only, so each field only needs
         # warming once for the lifetime of this client.
         self._warmed_fields: dict[str, set[str]] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize configuration, never process-local TQ/Mooncake handles."""
+        return {"cfg": self._cfg}
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Install plugins and connect a fresh client in the receiving process.
+
+        Single Controller actor arguments are built on the driver and
+        cloudpickled by Ray. ``__init__`` is not otherwise rerun in that actor,
+        so reconstruction here is what installs the process-local TQ registries
+        before the actor's first data-plane operation.
+        """
+        cfg = state.get("cfg")
+        if not isinstance(cfg, dict):
+            raise TypeError("Serialized TQDataPlaneClient state is missing cfg")
+        self.__init__(cfg, bootstrap=False)
 
     def _require_checkpointing_support(self) -> None:
         """Reject backends that cannot round-trip all data-plane state."""
@@ -801,9 +956,9 @@ class TQDataPlaneClient(DataPlaneClient):
         if not fields:
             return
         # Use a unique KV key instead of ``client.put``'s default row id
-        # (``0@field`` at the Mooncake storage layer). Mooncake does not
-        # support upsert, so repeated schema warmups can collide with
-        # stale metadata from a previous registration.
+        # (``0@field`` at the Mooncake storage layer), so a schema warmup
+        # never updates an existing row or depends on stale metadata from a
+        # previous registration.
         self._mark_data_operation_started()
         schema_key = (
             f"__schema__:{partition_id}:{os.getpid()}:{id(self)}:{time.time_ns()}"
@@ -1011,8 +1166,18 @@ class TQDataPlaneClient(DataPlaneClient):
                 )
             return
         self._mark_data_operation_started()
-        # TQ's wire vocabulary is `keys=` — translation point.
-        tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
+        if self._backend == "mooncake_cpu" and self._supports_checkpointing:
+            # Pinned TQ builds a multi-key clear BatchMeta from the fields shared
+            # by every selected row. Partial rows can have different produced
+            # fields, so batching would omit row-specific Mooncake objects and
+            # then release their global indexes. Singleton clears expose every
+            # field and its GDR n_chunks metadata to the checkpoint plugin's
+            # durability-fenced manager clear.
+            for sample_id in sample_ids:
+                tq.kv_clear(keys=[sample_id], partition_id=partition_id)
+        else:
+            # TQ's wire vocabulary is `keys=` — translation point.
+            tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
 
@@ -1026,6 +1191,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._require_checkpointing_support()
         _connect_existing()
         tq.save_checkpoint(checkpoint_dir, metadata=metadata)
+        _read_complete_checkpoint_metadata(checkpoint_dir)
 
     def load_checkpoint(self, checkpoint_dir: str | Path) -> dict[str, Any]:
         """Restore TQ state after initialization and before data operations.
@@ -1038,9 +1204,7 @@ class TQDataPlaneClient(DataPlaneClient):
         self._require_clean_for_load()
         # Validate the adapter-owned metadata before starting TQ's
         # non-transactional storage/controller restore.
-        metadata_path = Path(checkpoint_dir) / "metadata.json"
-        with metadata_path.open() as metadata_file:
-            checkpoint_metadata = json.load(metadata_file)
+        checkpoint_metadata = _read_complete_checkpoint_metadata(checkpoint_dir)
         user_metadata = checkpoint_metadata.get("user_metadata", {})
         if not isinstance(user_metadata, dict):
             raise ValueError("TQ checkpoint user_metadata must be a dictionary")
@@ -1054,8 +1218,37 @@ class TQDataPlaneClient(DataPlaneClient):
     def close(self) -> None:
         if self._closed:
             return
+        if self._owns_tq_system:
+            close_error: BaseException | None = None
+            try:
+                tq.close()
+            except BaseException as error:
+                close_error = error
+            finally:
+                # Upstream TQ deliberately leaves mooncake_master running. The
+                # experimental plugin terminates only its own recorded Popen,
+                # and only from the facade that owns the TQ system.
+                try:
+                    stop_tq_mooncake_checkpoint_master()
+                except BaseException as error:
+                    if close_error is None:
+                        close_error = error
+                    else:
+                        close_error.add_note(
+                            "Stopping the NeMo-RL-owned mooncake_master also failed: "
+                            f"{type(error).__name__}: {error}"
+                        )
+            if close_error is not None:
+                # Leave the facade retryable and surface the stale-controller
+                # risk to the lifecycle owner instead of reporting success.
+                raise close_error
+            self._closed = True
+            return
+
+        # Multiple facades can share TQ's one process-global client. An
+        # attach-only facade in the bootstrap process must leave that local
+        # client alone; attach-only Ray processes have no bootstrap storage
+        # and can detach their own local client safely.
+        if not _local_process_owns_tq_bootstrap():
+            _close_local_tq_client()
         self._closed = True
-        try:
-            tq.close()
-        except Exception:
-            pass

@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from tensordict import TensorDict
 
 DATA_PLANE_CHECKPOINT_SCHEMA_VERSION = 2
@@ -59,6 +59,37 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
 
     storage_capacity: int = 1000000  # max samples retained per partition
     num_storage_units: int
+
+
+class MooncakeCheckpointConfig(BaseModel, extra="forbid"):
+    """Experimental durable-storage hooks for TQ's Mooncake backend.
+
+    Disabled by default because direct Mooncake DISK replicas add a Lustre
+    write for every object.  ``storage_root`` is the shared-filesystem parent
+    for per-run live replicas and Mooncake logs. Callers choose each immutable
+    TQ checkpoint directory itself through ``save_checkpoint``.
+    """
+
+    enabled: bool = False
+    storage_root: str | None = None
+    durability_timeout_s: float = Field(default=300.0, gt=0)
+    poll_interval_s: float = Field(default=0.1, gt=0)
+    restore_batch_size: int = Field(default=1, gt=0)
+
+    @model_validator(mode="after")
+    def _require_absolute_storage_root(self) -> "MooncakeCheckpointConfig":
+        if not self.enabled:
+            return self
+        if not self.storage_root:
+            raise ValueError(
+                "storage_root is required when Mooncake checkpointing is enabled"
+            )
+        if not Path(self.storage_root).is_absolute():
+            raise ValueError(
+                "storage_root must be an absolute path when Mooncake "
+                "checkpointing is enabled"
+            )
+        return self
 
 
 class MooncakeCpuConfig(BaseModel, extra="allow"):
@@ -80,6 +111,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     admitted and never shrink — so raise it only when a per-key payload (one
     sample of one field) genuinely exceeds it, not for headroom.
 
+    ``use_gdr`` selects TransferQueue's GPUDirect RDMA path. Its single
+    ``gdr_staging_buffer_mb`` CUDA staging buffer is separate from the CPU
+    registered-buffer pool above; it is allocated lazily per eligible client
+    process. A zero-sized CUDA buffer intentionally falls back to CPU RDMA.
+
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
     That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
     transfer's peer rail to the local one by name; on a rail-isolated RoCE
@@ -91,6 +127,11 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     local_buffer_size: int = 4294967296  # 4 GiB per client process
     reuse_registered_buffers: bool = True
     staging_buffer_size: int = 268435456  # 256 MiB per pool slot
+    use_gdr: bool = False
+    gdr_staging_buffer_mb: int = Field(default=1024, ge=0)
+    checkpoint: MooncakeCheckpointConfig = Field(
+        default_factory=MooncakeCheckpointConfig
+    )
 
 
 class DataPlaneConfig(TypedDict):
@@ -131,17 +172,20 @@ class DataPlaneConfig(TypedDict):
     observability: NotRequired["ObservabilityConfig"]
 
 
-_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple"})
-
-
 def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
     """Return whether the configured backend supports complete save/load.
 
-    This is a static allow-list so an unrecognized future backend defaults to
-    unsupported until its storage payload and controller metadata are both
-    known to round-trip through a checkpoint.
+    SimpleStorage supports this natively. Mooncake supports it only through
+    NeMo-RL's experimental, explicitly enabled TQ plugin. An unrecognized
+    future backend remains unsupported until its storage payload and
+    controller metadata are both known to round-trip through a checkpoint.
     """
-    return cfg["backend"] in _CHECKPOINTABLE_BACKENDS
+    backend = cfg["backend"]
+    if backend == "simple":
+        return True
+    if backend == "mooncake_cpu":
+        return backend_config(cfg).checkpoint.enabled
+    return False
 
 
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {

@@ -288,6 +288,7 @@ class _FakeDPClient:
         self.save_calls: list[dict[str, Any]] = []
         self.save_error = save_error
         self.sample_ids = list(sample_ids or [])
+        self.close_calls = 0
 
     def list_sample_ids(self, partition_id: str) -> list[str]:
         assert partition_id == _PARTITION_ID
@@ -317,12 +318,17 @@ class _FakeDPClient:
         with open(os.path.join(checkpoint_dir, "metadata.json"), "w") as f:
             json.dump({"user_metadata": metadata or {}}, f)
 
+    def close(self) -> None:
+        self.close_calls += 1
+
 
 class _BlockingDPClient(_FakeDPClient):
     def __init__(self) -> None:
         super().__init__()
         self.save_started = threading.Event()
         self.release_save = threading.Event()
+        self.save_finished = threading.Event()
+        self.lifecycle_events: list[str] = []
 
     def save_checkpoint(
         self,
@@ -330,9 +336,18 @@ class _BlockingDPClient(_FakeDPClient):
         *,
         metadata: Optional[dict[str, Any]] = None,
     ) -> None:
+        self.lifecycle_events.append("save_started")
         self.save_started.set()
-        assert self.release_save.wait(timeout=30.0), "test never released TQ save"
-        super().save_checkpoint(checkpoint_dir, metadata=metadata)
+        try:
+            assert self.release_save.wait(timeout=30.0), "test never released TQ save"
+            super().save_checkpoint(checkpoint_dir, metadata=metadata)
+        finally:
+            self.lifecycle_events.append("save_finished")
+            self.save_finished.set()
+
+    def close(self) -> None:
+        self.lifecycle_events.append("close")
+        super().close()
 
 
 class _FakeWeightSynchronizer:
@@ -674,6 +689,72 @@ def _step_dir_names(ckpt_dir: Path) -> set[str]:
 def _training_info(ckpt_dir: Path, step: int) -> dict[str, Any]:
     with open(ckpt_dir / f"step_{step}" / "training_info.json") as f:
         return json.load(f)
+
+
+class TestRunTeardown:
+    @staticmethod
+    def _configure_run_pumps(actor: Any, *, rollout_error: Exception | None) -> None:
+        actor._sync_weights = AsyncMock(return_value=0)
+        actor._maybe_restore_replay_buffer = AsyncMock(return_value=None)
+        actor._maybe_restore_replacement_reserve = AsyncMock(return_value=None)
+
+        async def rollout_pump() -> None:
+            if rollout_error is not None:
+                raise rollout_error
+
+        async def train_pump() -> None:
+            return None
+
+        async def watchdog_pump() -> None:
+            await asyncio.Event().wait()
+
+        actor._rollout_pump = rollout_pump
+        actor._train_pump = train_pump
+        actor._stall_watchdog_pump = watchdog_pump
+
+    def test_successful_body_propagates_final_checkpoint_failure(self, tmp_path):
+        async def _main() -> None:
+            actor = _ACTOR_CLS(
+                _actor_master_config(tmp_path, max_num_steps=0),
+                _make_actor_args(),
+                SetupTimingMetrics(),
+            )
+            self._configure_run_pumps(actor, rollout_error=None)
+            actor._checkpointer.shutdown = MagicMock(
+                side_effect=RuntimeError("injected finalization failure")
+            )
+
+            with pytest.raises(RuntimeError, match="injected finalization failure"):
+                await actor.run()
+
+        asyncio.run(_main())
+
+    def test_pump_failure_is_preserved_when_final_checkpoint_cleanup_also_fails(
+        self,
+        tmp_path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        async def _main() -> None:
+            actor = _ACTOR_CLS(
+                _actor_master_config(tmp_path, max_num_steps=0),
+                _make_actor_args(),
+                SetupTimingMetrics(),
+            )
+            self._configure_run_pumps(
+                actor, rollout_error=ValueError("injected rollout failure")
+            )
+            actor._checkpointer.shutdown = MagicMock(
+                side_effect=RuntimeError("injected finalization failure")
+            )
+
+            with pytest.raises(ValueError, match="injected rollout failure"):
+                await actor.run()
+
+        asyncio.run(_main())
+        assert (
+            "Error during checkpointer shutdown: injected finalization failure"
+            in capsys.readouterr().out
+        )
 
 
 # ── counter restore ──────────────────────────────────────────────────────────
@@ -1128,6 +1209,135 @@ class TestDataPlaneCheckpoint:
             _run_train_pump(mc, _make_actor_args(dp_client=dp_client))
 
         assert not (tmp_path / "checkpoints" / "step_1").exists()
+
+    def test_run_cancellation_drains_tq_save_before_data_plane_close(self, tmp_path):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            data_plane_checkpoint=True,
+        )
+        dp_client = _BlockingDPClient()
+
+        async def _main() -> tuple[bool, int]:
+            actor = _ACTOR_CLS(
+                mc, _make_actor_args(dp_client=dp_client), SetupTimingMetrics()
+            )
+            actor._sync_weights = AsyncMock(return_value=0)
+            actor._maybe_restore_replay_buffer = AsyncMock(return_value=None)
+            actor._maybe_restore_replacement_reserve = AsyncMock(return_value=None)
+            actor._save_state.trainer_version = actor._trainer_version
+
+            idle = asyncio.Event()
+
+            async def _idle_pump() -> None:
+                await idle.wait()
+
+            async def _checkpoint_pump() -> None:
+                await actor._save_data_plane_checkpoint(tmp_path / "tmp_step_0")
+                await idle.wait()
+
+            actor._rollout_pump = _idle_pump
+            actor._train_pump = _checkpoint_pump
+            actor._stall_watchdog_pump = _idle_pump
+
+            run_task = asyncio.create_task(actor.run())
+            started = await asyncio.to_thread(dp_client.save_started.wait, 30.0)
+            assert started
+
+            run_task.cancel()
+            # Give run() enough turns to enter its cancellation-safe drain, then
+            # cancel it again. Repeated cancellation must not detach the
+            # synchronous save or close TQ underneath it.
+            await asyncio.sleep(0.05)
+            run_task.cancel()
+            await asyncio.sleep(0.05)
+            done_before_release = run_task.done()
+            close_calls_before_release = dp_client.close_calls
+
+            dp_client.release_save.set()
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+            return done_before_release, close_calls_before_release
+
+        done_before_release, close_calls_before_release = asyncio.run(_main())
+
+        assert not done_before_release
+        assert close_calls_before_release == 0
+        assert dp_client.save_finished.is_set()
+        assert dp_client.lifecycle_events == [
+            "save_started",
+            "save_finished",
+            "close",
+        ]
+
+    def test_sibling_pump_failure_drains_tq_save_before_data_plane_close(
+        self, tmp_path
+    ):
+        mc = _actor_master_config(
+            tmp_path,
+            max_num_steps=1,
+            save_period=1,
+            data_plane_checkpoint=True,
+        )
+        dp_client = _BlockingDPClient()
+
+        async def _main() -> tuple[bool, int]:
+            actor = _ACTOR_CLS(
+                mc, _make_actor_args(dp_client=dp_client), SetupTimingMetrics()
+            )
+            actor._sync_weights = AsyncMock(return_value=0)
+            actor._maybe_restore_replay_buffer = AsyncMock(return_value=None)
+            actor._maybe_restore_replacement_reserve = AsyncMock(return_value=None)
+            actor._save_state.trainer_version = actor._trainer_version
+
+            idle = asyncio.Event()
+            fail_sibling = asyncio.Event()
+            sibling_failed = asyncio.Event()
+
+            async def _checkpoint_pump() -> None:
+                await actor._save_data_plane_checkpoint(tmp_path / "tmp_step_0")
+                await idle.wait()
+
+            async def _failing_pump() -> None:
+                await fail_sibling.wait()
+                sibling_failed.set()
+                raise RuntimeError("injected sibling-pump failure")
+
+            async def _idle_pump() -> None:
+                await idle.wait()
+
+            actor._rollout_pump = _failing_pump
+            actor._train_pump = _checkpoint_pump
+            actor._stall_watchdog_pump = _idle_pump
+
+            run_task = asyncio.create_task(actor.run())
+            started = await asyncio.to_thread(dp_client.save_started.wait, 30.0)
+            assert started
+
+            fail_sibling.set()
+            await sibling_failed.wait()
+            # The sibling has failed and run() is tearing the pumps down, but
+            # the process-local client must remain open until its save returns.
+            await asyncio.sleep(0.05)
+            done_before_release = run_task.done()
+            close_calls_before_release = dp_client.close_calls
+
+            dp_client.release_save.set()
+            with pytest.raises(RuntimeError, match="injected sibling-pump failure"):
+                await run_task
+            return done_before_release, close_calls_before_release
+
+        done_before_release, close_calls_before_release = asyncio.run(_main())
+
+        assert not done_before_release
+        assert close_calls_before_release == 0
+        assert dp_client.save_finished.is_set()
+        assert dp_client.lifecycle_events == [
+            "save_started",
+            "save_finished",
+            "close",
+        ]
 
     def test_consumed_clear_waits_for_tq_save(self, tmp_path):
         mc = _actor_master_config(
@@ -1767,14 +1977,22 @@ class TestReplayBufferPersistence:
             data_plane_checkpoint=True,
         )
         buffer = _FakeTQBuffer()
+        dp_client = _FakeDPClient()
 
         with pytest.raises(RuntimeError, match="legacy replay_buffer.pt"):
             _run_actor_run(
                 mc,
-                _make_actor_args(tq_buffer=buffer, last_checkpoint_path=str(ckpt_dir)),
+                _make_actor_args(
+                    tq_buffer=buffer,
+                    dp_client=dp_client,
+                    last_checkpoint_path=str(ckpt_dir),
+                ),
             )
 
         assert buffer.load_calls == []
+        # Restore fails before the pumps are created, but process-local clients
+        # still need deterministic teardown in the actor process.
+        assert dp_client.close_calls == 1
 
     def test_run_restores_native_tq_replay_metadata_without_payload_reput(
         self, tmp_path
@@ -1809,11 +2027,12 @@ class TestReplayBufferPersistence:
         )
         buffer = _FakeTQBuffer(load_return=2)
 
+        dp_client = _FakeDPClient(sample_ids=sample_ids)
         actor, result = _run_actor_run(
             mc,
             _make_actor_args(
                 tq_buffer=buffer,
-                dp_client=_FakeDPClient(sample_ids=sample_ids),
+                dp_client=dp_client,
                 last_checkpoint_path=str(ckpt_dir),
                 data_plane_checkpoint_metadata=tq_metadata,
             ),
@@ -1832,6 +2051,7 @@ class TestReplayBufferPersistence:
         assert result["train_steps"] == 0
         # run()'s finally must tear the synchronizer down exactly once.
         assert actor._weight_synchronizer.shutdown_count == 1
+        assert dp_client.close_calls == 1
 
     def test_restored_permits_are_released_by_a_live_pump(self, tmp_path):
         # The restore takes one capacity permit per group; a running pump must

@@ -61,12 +61,19 @@ def test_checkpointing_capability_defaults_to_unsupported(
 def test_nested_block_is_used() -> None:
     cfg = _cfg(
         "mooncake_cpu",
-        mooncake_cpu={"global_segment_size": 111, "reuse_registered_buffers": False},
+        mooncake_cpu={
+            "global_segment_size": 111,
+            "reuse_registered_buffers": False,
+            "use_gdr": True,
+            "gdr_staging_buffer_mb": 256,
+        },
     )
     resolved = backend_config(cfg)
     assert isinstance(resolved, MooncakeCpuConfig)
     assert resolved.global_segment_size == 111
     assert resolved.reuse_registered_buffers is False
+    assert resolved.use_gdr is True
+    assert resolved.gdr_staging_buffer_mb == 256
 
 
 def test_absent_block_falls_back_to_model_defaults() -> None:
@@ -81,6 +88,65 @@ def test_absent_block_falls_back_to_model_defaults() -> None:
     assert resolved.local_buffer_size == 4294967296  # 4 GiB per client process
     # The opt-out flag defaults on, so omitting it must not disable the pool.
     assert resolved.reuse_registered_buffers is True
+    # These match TransferQueue's pinned MooncakeStore defaults.
+    assert resolved.use_gdr is False
+    assert resolved.gdr_staging_buffer_mb == 1024
+    assert resolved.checkpoint.enabled is False
+    assert resolved.checkpoint.storage_root is None
+    assert resolved.checkpoint.restore_batch_size == 1
+
+
+def test_gdr_zero_buffer_fallback_is_valid_but_negative_size_is_not() -> None:
+    resolved = backend_config(
+        _cfg(
+            "mooncake_cpu",
+            mooncake_cpu={"use_gdr": True, "gdr_staging_buffer_mb": 0},
+        )
+    )
+    assert resolved.use_gdr is True
+    assert resolved.gdr_staging_buffer_mb == 0
+
+    with pytest.raises(pydantic.ValidationError, match="gdr_staging_buffer_mb"):
+        backend_config(
+            _cfg(
+                "mooncake_cpu",
+                mooncake_cpu={"use_gdr": True, "gdr_staging_buffer_mb": -1},
+            )
+        )
+
+
+def test_mooncake_checkpoint_capability_requires_explicit_valid_opt_in() -> None:
+    cfg = _cfg(
+        "mooncake_cpu",
+        mooncake_cpu={
+            "checkpoint": {
+                "enabled": True,
+                "storage_root": "/lustre/checkpoints/tq-mooncake",
+            }
+        },
+    )
+
+    assert data_plane_supports_checkpointing(cfg) is True
+    assert backend_config(cfg).checkpoint.storage_root == (
+        "/lustre/checkpoints/tq-mooncake"
+    )
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        {"enabled": True},
+        {"enabled": True, "storage_root": "relative/path"},
+        {
+            "enabled": True,
+            "storage_root": "/lustre/checkpoints/tq-mooncake",
+            "durability_timeout_s": 0,
+        },
+    ],
+)
+def test_mooncake_checkpoint_opt_in_rejects_unsafe_config(checkpoint: dict) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        backend_config(_cfg("mooncake_cpu", mooncake_cpu={"checkpoint": checkpoint}))
 
 
 def test_accepts_an_already_coerced_model() -> None:

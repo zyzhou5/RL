@@ -18,8 +18,11 @@ else would catch it.
 
 import os
 import sys
+from types import ModuleType
+from unittest.mock import MagicMock
 
 import pytest
+from omegaconf import OmegaConf
 
 from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
 from nemo_rl.data_plane.adapters import transfer_queue_env as tq_env
@@ -131,6 +134,40 @@ def test_raises_when_no_device_since_mooncake_is_rdma_only(fake_fabric):
         tq_adapter._mooncake_transport_config()
 
 
+def test_init_tq_forwards_gdr_config_to_mooncake_store(fake_fabric, monkeypatch):
+    fake_fabric({"mlx5_0": "InfiniBand"})
+
+    mooncake = ModuleType("mooncake")
+    mooncake.__file__ = "/opt/mooncake/__init__.py"
+    mooncake.__path__ = []
+    mooncake_store = ModuleType("mooncake.store")
+    mooncake.store = mooncake_store
+    monkeypatch.setitem(sys.modules, "mooncake", mooncake)
+    monkeypatch.setitem(sys.modules, "mooncake.store", mooncake_store)
+    monkeypatch.setattr(tq_adapter.os, "chmod", lambda *_args: None)
+    monkeypatch.setattr(tq_adapter, "_get_local_node_ip", lambda: "10.0.0.1")
+    monkeypatch.setattr(OmegaConf, "load", lambda _path: OmegaConf.create({}))
+    init = MagicMock()
+    monkeypatch.setattr(tq_adapter.tq, "init", init)
+
+    tq_adapter._init_tq(
+        {
+            **_mooncake_cfg(),
+            "mooncake_cpu": {
+                "use_gdr": True,
+                "gdr_staging_buffer_mb": 256,
+            },
+        }
+    )
+
+    conf = init.call_args.kwargs["conf"]
+    mooncake_conf = conf.backend.MooncakeStore
+    assert mooncake_conf.protocol == "rdma"
+    assert mooncake_conf.device_name == "mlx5_0"
+    assert mooncake_conf.use_gdr is True
+    assert mooncake_conf.gdr_staging_buffer_mb == 256
+
+
 # ── Peer-rail pairing ────────────────────────────────────────────────────────
 #
 # Mooncake picks the peer rail at random unless told otherwise. Where each rail
@@ -158,6 +195,10 @@ def clean_env(monkeypatch):
     monkeypatch.setattr(os, "environ", dict(os.environ))
     monkeypatch.delenv("MC_ENABLE_DEST_DEVICE_AFFINITY", raising=False)
     monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+    monkeypatch.delenv(
+        tq_env.MOONCAKE_CHECKPOINT_SESSION_ENV,
+        raising=False,
+    )
     monkeypatch.setattr(tq_env, "_engine_already_imported", lambda: None)
 
 
@@ -197,6 +238,44 @@ def test_existing_value_is_not_clobbered(clean_env, fake_fabric):
     os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] = "0"
     tq_env.configure_engine_env(_mooncake_cfg())
     assert os.environ["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "0"
+
+
+def test_checkpoint_opt_in_mints_one_launcher_wide_session(clean_env, fake_fabric):
+    fake_fabric({"mlx5_0": "InfiniBand"})
+    cfg = {
+        **_mooncake_cfg(),
+        "mooncake_cpu": {
+            "checkpoint": {
+                "enabled": True,
+                "storage_root": "/lustre/checkpoints/tq-mooncake",
+            }
+        },
+    }
+
+    tq_env.configure_engine_env(cfg)
+    first_session = os.environ[tq_env.MOONCAKE_CHECKPOINT_SESSION_ENV]
+    tq_env.configure_engine_env(cfg)
+
+    assert first_session.startswith("nrl-")
+    assert os.environ[tq_env.MOONCAKE_CHECKPOINT_SESSION_ENV] == first_session
+
+
+def test_launcher_supplied_checkpoint_session_is_preserved(clean_env, fake_fabric):
+    fake_fabric({"mlx5_0": "InfiniBand"})
+    os.environ[tq_env.MOONCAKE_CHECKPOINT_SESSION_ENV] = "controlled-session"
+    tq_env.configure_engine_env(
+        {
+            **_mooncake_cfg(),
+            "mooncake_cpu": {
+                "checkpoint": {
+                    "enabled": True,
+                    "storage_root": "/lustre/checkpoints/tq-mooncake",
+                }
+            },
+        }
+    )
+
+    assert os.environ[tq_env.MOONCAKE_CHECKPOINT_SESSION_ENV] == "controlled-session"
 
 
 def test_not_applied_to_simple_backend(clean_env, fake_fabric):

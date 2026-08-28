@@ -32,8 +32,14 @@ from __future__ import annotations
 import glob
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from nemo_rl.utils.tq_mooncake_checkpoint import (
+    MOONCAKE_CHECKPOINT_SESSION_ENV,
+    mooncake_checkpoint_enabled,
+)
 
 if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -111,7 +117,16 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     if cfg["backend"] != "mooncake_cpu":
         return
 
-    missing = {k: v for k, v in _wanted_engine_env().items() if k not in os.environ}
+    wanted = _wanted_engine_env()
+    if mooncake_checkpoint_enabled(cfg):
+        # One identity names this launch's live shared-filesystem replicas.
+        # Set it on the driver before Ray snapshots the environment so every
+        # TQ process joins the same Mooncake disk-replica namespace. A launcher
+        # may provide its own unique deterministic value for controlled tests;
+        # otherwise a new run never reuses stale files from a prior launch.
+        wanted[MOONCAKE_CHECKPOINT_SESSION_ENV] = f"nrl-{uuid.uuid4().hex}"
+
+    missing = {k: v for k, v in wanted.items() if k not in os.environ}
     if not missing:
         # Already set by the launcher, or by an earlier call in this process.
         return

@@ -56,7 +56,9 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     # The driver now polls ping() around the run. Report the run as ready on the first
     # check so these tests keep exercising the same path they always did.
     ray_wait = MagicMock(side_effect=lambda refs, timeout=None: (list(refs), []))
+    ray_cancel = MagicMock()
     ray_kill = MagicMock()
+    monkeypatch.setattr(run_grpo_single_controller, "_PRESERVED_TQ_OWNERS", [])
 
     monkeypatch.setattr(
         run_grpo_single_controller,
@@ -98,9 +100,11 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     )
     monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
     monkeypatch.setattr(run_grpo_single_controller.ray, "wait", ray_wait)
+    monkeypatch.setattr(run_grpo_single_controller.ray, "cancel", ray_cancel)
     monkeypatch.setattr(run_grpo_single_controller.ray, "kill", ray_kill)
 
     return SimpleNamespace(
+        actor=actor,
         actor_args=actor_args,
         config=config,
         configure_generation=configure_generation,
@@ -108,6 +112,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         generation_config=generation_config,
         ray_get=ray_get,
         ray_wait=ray_wait,
+        ray_cancel=ray_cancel,
         ray_kill=ray_kill,
     )
 
@@ -170,3 +175,202 @@ def test_main_configures_generation_for_trained_mtp(
     assert (
         main_context.config.policy["generation"] is main_context.configured_generation
     )
+
+
+def test_main_shuts_down_value_before_tq_owner_trainer(
+    main_context: SimpleNamespace,
+) -> None:
+    events: list[str] = []
+    trainer_live = True
+
+    def shutdown_generation() -> None:
+        events.append("Generation")
+
+    def shutdown_value() -> None:
+        assert trainer_live
+        events.append("Value")
+
+    def shutdown_trainer() -> None:
+        nonlocal trainer_live
+        events.append("Trainer")
+        trainer_live = False
+
+    main_context.actor_args.gen_handle = SimpleNamespace(shutdown=shutdown_generation)
+    main_context.actor_args.value_handle = SimpleNamespace(shutdown=shutdown_value)
+    main_context.actor_args.trainer_handle = SimpleNamespace(shutdown=shutdown_trainer)
+
+    run_grpo_single_controller.main()
+
+    assert events == ["Generation", "Value", "Trainer"]
+    assert not trainer_live
+
+
+def test_value_shutdown_failure_preserves_tq_owner_trainer(
+    main_context: SimpleNamespace,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[str] = []
+    main_context.actor_args.gen_handle = SimpleNamespace(
+        shutdown=lambda: events.append("Generation")
+    )
+
+    def fail_value_shutdown() -> bool:
+        events.append("Value")
+        return False
+
+    main_context.actor_args.value_handle = SimpleNamespace(shutdown=fail_value_shutdown)
+
+    def preserve_owner(reason: str) -> None:
+        events.append(f"preserve:{reason}")
+
+    main_context.actor_args.trainer_handle = SimpleNamespace(
+        shutdown=lambda: events.append("Trainer"),
+        preserve_data_plane_on_shutdown=preserve_owner,
+    )
+
+    run_grpo_single_controller.main()
+
+    assert events == [
+        "Generation",
+        "Value",
+        "preserve:value workers may still be attached",
+    ]
+    assert run_grpo_single_controller._PRESERVED_TQ_OWNERS == [
+        main_context.actor_args.trainer_handle
+    ]
+    assert "Trainer shutdown skipped" in capsys.readouterr().out
+
+
+def test_liveness_failure_stops_controller_before_tq_resources(
+    main_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    main_context.config.async_rl.stall_watchdog = SimpleNamespace(
+        interval_s=1.0,
+        stall_timeout_s=0.0,
+    )
+    main_context.actor.ping = SimpleNamespace(remote=MagicMock(return_value="ping"))
+    main_context.ray_wait.side_effect = lambda refs, timeout=None: ([], list(refs))
+    controller_killed = False
+
+    def ray_get(ref: object, timeout: float | None = None) -> None:
+        if ref == "ping":
+            raise RuntimeError("injected ping timeout")
+        if ref == "run" and timeout == run_grpo_single_controller._SHUTDOWN_TIMEOUT_S:
+            if controller_killed:
+                return None
+            raise run_grpo_single_controller.ray.exceptions.GetTimeoutError(
+                "injected cancellation timeout"
+            )
+        raise AssertionError(f"unexpected ray.get({ref!r}, timeout={timeout!r})")
+
+    def ray_kill(actor: object) -> None:
+        nonlocal controller_killed
+        events.append(
+            "kill:controller" if actor is main_context.actor else "kill:other"
+        )
+        controller_killed = True
+
+    main_context.ray_get.side_effect = ray_get
+    main_context.ray_cancel.side_effect = lambda ref: events.append(f"cancel:{ref}")
+    main_context.ray_kill.side_effect = ray_kill
+    main_context.actor_args.gen_handle = SimpleNamespace(
+        shutdown=lambda: events.append("Generation")
+    )
+    main_context.actor_args.value_handle = SimpleNamespace(
+        shutdown=lambda: events.append("Value")
+    )
+
+    def preserve_owner(reason: str) -> None:
+        events.append(f"preserve:{reason}")
+
+    main_context.actor_args.trainer_handle = SimpleNamespace(
+        shutdown=lambda: events.append("Trainer"),
+        preserve_data_plane_on_shutdown=preserve_owner,
+    )
+    monotonic_values = iter([0.0, 1.0])
+    monkeypatch.setattr(
+        run_grpo_single_controller.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    with pytest.raises(RuntimeError, match="event loop has been unresponsive"):
+        run_grpo_single_controller.main()
+
+    assert events == [
+        "cancel:run",
+        "kill:controller",
+        "Generation",
+        "Value",
+        "Trainer",
+    ]
+
+
+def test_force_kill_failure_preserves_all_controller_dependencies(
+    main_context: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[str] = []
+    main_context.config.async_rl.stall_watchdog = SimpleNamespace(
+        interval_s=1.0,
+        stall_timeout_s=0.0,
+    )
+    main_context.actor.ping = SimpleNamespace(remote=MagicMock(return_value="ping"))
+    main_context.ray_wait.side_effect = lambda refs, timeout=None: ([], list(refs))
+
+    def ray_get(ref: object, timeout: float | None = None) -> None:
+        if ref == "ping":
+            raise RuntimeError("injected ping timeout")
+        if ref == "run" and timeout == run_grpo_single_controller._SHUTDOWN_TIMEOUT_S:
+            raise run_grpo_single_controller.ray.exceptions.GetTimeoutError(
+                "injected cancellation timeout"
+            )
+        raise AssertionError(f"unexpected ray.get({ref!r}, timeout={timeout!r})")
+
+    def ray_kill(actor: object) -> None:
+        assert actor is main_context.actor
+        events.append("kill:controller")
+        raise RuntimeError("injected force-kill failure")
+
+    main_context.ray_get.side_effect = ray_get
+    main_context.ray_cancel.side_effect = lambda ref: events.append(f"cancel:{ref}")
+    main_context.ray_kill.side_effect = ray_kill
+    main_context.actor_args.gen_handle = SimpleNamespace(
+        shutdown=lambda: events.append("Generation")
+    )
+    main_context.actor_args.value_handle = SimpleNamespace(
+        shutdown=lambda: events.append("Value")
+    )
+
+    def preserve_owner(reason: str) -> None:
+        events.append(f"preserve:{reason}")
+
+    main_context.actor_args.trainer_handle = SimpleNamespace(
+        shutdown=lambda: events.append("Trainer"),
+        preserve_data_plane_on_shutdown=preserve_owner,
+    )
+    monotonic_values = iter([0.0, 1.0])
+    monkeypatch.setattr(
+        run_grpo_single_controller.time,
+        "monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    with pytest.raises(
+        run_grpo_single_controller._ControllerTerminationError,
+        match="force-kill failed",
+    ):
+        run_grpo_single_controller.main()
+
+    assert events == [
+        "cancel:run",
+        "kill:controller",
+        "preserve:Single Controller could not be proven terminal",
+    ]
+    assert run_grpo_single_controller._PRESERVED_TQ_OWNERS == [
+        main_context.actor_args.trainer_handle
+    ]
+    assert "Skipping driver resource teardown" in capsys.readouterr().out

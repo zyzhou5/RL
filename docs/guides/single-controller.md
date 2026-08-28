@@ -54,7 +54,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing currently supports only the `simple` storage backend. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
+5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. TQ supports `simple` natively. NeMo-RL also provides an experimental, opt-in Mooncake plugin described in [TQ checkpointing with Mooncake](../design-docs/tq-mooncake-checkpointing.md). For multi-node runs, both the checkpoint directory and any Mooncake storage root must be durable filesystems visible at the same path from every node.
 
     ```yaml
     checkpointing:
@@ -67,6 +67,20 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       backend: "simple"
     ```
 
+    To use the experimental Mooncake path instead:
+
+    ```yaml
+    data_plane:
+      enabled: true
+      backend: "mooncake_cpu"
+      mooncake_cpu:
+        checkpoint:
+          enabled: true
+          storage_root: /shared/tq-mooncake
+    ```
+
+    Enabling it writes one live DISK replica to the shared filesystem for every Mooncake PUT/upsert and then copies all referenced payloads into each immutable checkpoint. Leave it disabled for runs that do not need data-plane recovery.
+
 6. **(PPO) Set `ppo:` instead of `grpo:`** — the two algorithm blocks are mutually exclusive, and SC reads every step setting from whichever one is present. A PPO run also needs `value:`, `value_loss_fn:` and `ppo.adv_estimator.name: gae` (same schemas as legacy PPO), a Megatron critic, and `policy.offload_optimizer_for_logprob: true`, which is what keeps the policy optimizer off the GPU while the critic runs. `ppo.policy_training_start_step: N` gives the usual critic warmup: for the first N steps the policy is neither trained nor refit, while the critic trains every step.
 
 ## Checkpointing and Replay Recovery
@@ -74,7 +88,8 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint contains:
 
 - The normal model, dataloader, and controller state, plus optimizer state when configured.
-- A native TQ snapshot containing rollout tensor payloads and TQ state.
+- A TQ snapshot containing every controller-referenced payload field, including
+  tensor and non-tensor values, plus TQ controller and consumption state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
@@ -90,7 +105,7 @@ This checkpointing path recovers completed groups that have been committed to TQ
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
 
-Native TQ save/load currently requires `data_plane.backend: "simple"`. Mooncake-backed storage is not recoverable through this mechanism. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
+Mooncake save/load is advertised as supported only when `data_plane.mooncake_cpu.checkpoint.enabled: true` passes validation. The adapter requires TQ's `metadata.json.storage_saved` receipt to be true, so TQ's controller-only fallback is never accepted as a resumable data-plane checkpoint. A failure while saving or validating either backend prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
 
 ## Async-RL Knobs and Sampler Modes
 

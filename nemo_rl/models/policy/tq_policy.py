@@ -114,6 +114,7 @@ class TQPolicy(TQDriverMixin, Policy):
                 f"TP/PP/CP/EP sizes."
             )
         self.dp_cfg = dp_cfg
+        self._data_plane_shutdown_blocked = False
         self.dp_client = build_data_plane_client(dp_cfg, bootstrap=True)
         self.tq_partition_id = tq_partition_id
         self._router_replay_enabled = bool(
@@ -136,13 +137,45 @@ class TQPolicy(TQDriverMixin, Policy):
         """Restore TQ through the clean bootstrap client during SC setup."""
         return self.dp_client.load_checkpoint(checkpoint_dir)
 
+    def preserve_data_plane_on_shutdown(self, reason: str) -> None:
+        """Prevent destructor retries from tearing down a possibly-live TQ system."""
+        self._data_plane_shutdown_blocked = True
+        warnings.warn(
+            f"Preserving policy workers and the owner TQ system: {reason}",
+            RuntimeWarning,
+        )
+
     def shutdown(self) -> bool:  # type: ignore[override]
-        """Close the TQ client before shutting down the worker group."""
+        """Shut down workers before closing the owner TQ client."""
+        if getattr(self, "_data_plane_shutdown_blocked", False):
+            return False
+
+        try:
+            workers_stopped = super().shutdown()
+        except BaseException:
+            # WorkerGroup.shutdown may discard its local actor references even
+            # when termination fails. Never let a later __del__ retry mistake
+            # that empty list for proof that the workers are gone.
+            self._data_plane_shutdown_blocked = True
+            raise
+        if not workers_stopped:
+            # The bootstrap facade may own the TQ controller and the plugin's
+            # mooncake_master. Fail closed: surviving policy workers may still
+            # be using both, so leave the owner facade open for a later retry.
+            self._data_plane_shutdown_blocked = True
+            warnings.warn(
+                "Policy workers did not shut down; preserving the owner "
+                "data-plane client and TQ system",
+                RuntimeWarning,
+            )
+            return False
+
         try:
             self.dp_client.close()
         except Exception as e:
-            warnings.warn(f"Error closing data-plane client: {e}")
-        return super().shutdown()
+            warnings.warn(f"Error closing data-plane client: {e}", RuntimeWarning)
+            return False
+        return True
 
     def prepare_step(
         self,

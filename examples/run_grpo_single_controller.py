@@ -53,6 +53,17 @@ from nemo_rl.utils.logger import get_next_experiment_dir
 # replace a real training error with an indefinite hang.
 _SHUTDOWN_TIMEOUT_S = 10
 
+
+class _ControllerTerminationError(RuntimeError):
+    """The driver could not prove that Single Controller stopped."""
+
+
+# Fail-closed references used only when teardown cannot prove dependents are
+# terminal. Keeping the owner reachable prevents an eager __del__ retry while
+# the driver reports the failure.
+_PRESERVED_TQ_OWNERS: list[Any] = []
+
+
 # Drop examples/ from sys.path so examples/nemo_gym/ (no __init__.py) doesn't
 # shadow the real nemo_gym package as a namespace package.
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -152,32 +163,97 @@ def main() -> None:
         actor_args=actor_args,
         setup_timing_metrics=setup_timing_metrics,
     )
+    controller_stopped = False
     try:
-        result = _run_with_controller_liveness_watch(sc, config.async_rl.stall_watchdog)
-        print(f"SC run complete: {result}")
+        try:
+            result = _run_with_controller_liveness_watch(
+                sc, config.async_rl.stall_watchdog
+            )
+        except _ControllerTerminationError:
+            raise
+        except BaseException:
+            # _run_with_controller_liveness_watch only re-raises the run error
+            # after its cancellation/kill path has proved the task terminal.
+            controller_stopped = True
+            raise
+        else:
+            controller_stopped = True
+            print(f"SC run complete: {result}")
     finally:
-        # Drain env actors before generation to avoid in-flight requests during shutdown.
-        for env_name, handle in actor_args.env_handles.items():
-            try:
-                ray.get(handle.shutdown.remote(), timeout=_SHUTDOWN_TIMEOUT_S)
-            except Exception as e:
-                print(f"Env {env_name!r} shutdown failed: {e}")
-                try:
-                    ray.kill(handle)
-                except Exception as kill_error:
-                    print(f"Env {env_name!r} kill failed: {kill_error}")
+        if controller_stopped:
+            _shutdown_driver_resources(actor_args)
+        else:
+            _preserve_trainer_tq_owner(
+                actor_args,
+                "Single Controller could not be proven terminal",
+            )
+            print(
+                "Skipping driver resource teardown because Single Controller "
+                "may still be alive; preserving its workers and TQ owner.",
+                flush=True,
+            )
 
-        for resource_name, resource in (
-            ("Generation", actor_args.gen_handle),
-            ("Trainer", actor_args.trainer_handle),
-            ("Value", actor_args.value_handle),
-        ):
-            if resource is None:
-                continue
+
+def _shutdown_driver_resources(actor_args: Any) -> None:
+    """Stop dependents in ownership order after Single Controller is terminal."""
+    # Drain env actors before generation to avoid in-flight requests during shutdown.
+    for env_name, handle in actor_args.env_handles.items():
+        try:
+            ray.get(handle.shutdown.remote(), timeout=_SHUTDOWN_TIMEOUT_S)
+        except Exception as e:
+            print(f"Env {env_name!r} shutdown failed: {e}")
             try:
-                resource.shutdown()
-            except Exception as e:
-                print(f"{resource_name} shutdown failed: {e}")
+                ray.kill(handle)
+            except Exception as kill_error:
+                print(f"Env {env_name!r} kill failed: {kill_error}")
+
+    for resource_name, resource in (
+        ("Generation", actor_args.gen_handle),
+        ("Value", actor_args.value_handle),
+        # The trainer owns the bootstrap TQ client/controller. Stop every
+        # attached model first so their process-local clients can detach.
+        ("Trainer", actor_args.trainer_handle),
+    ):
+        if resource is None:
+            continue
+        try:
+            stopped = resource.shutdown()
+        except Exception as e:
+            print(f"{resource_name} shutdown failed: {e}")
+            if resource_name == "Value":
+                _preserve_trainer_tq_owner(
+                    actor_args,
+                    "value workers may still be attached",
+                )
+                print(
+                    "Trainer shutdown skipped because value workers may still "
+                    "be attached to its TQ owner."
+                )
+                break
+        else:
+            if stopped is False and resource_name == "Value":
+                _preserve_trainer_tq_owner(
+                    actor_args,
+                    "value workers may still be attached",
+                )
+                print(
+                    "Trainer shutdown skipped because value workers may still "
+                    "be attached to its TQ owner."
+                )
+                break
+
+
+def _preserve_trainer_tq_owner(actor_args: Any, reason: str) -> None:
+    """Block explicit and destructor-driven owner teardown after uncertainty."""
+    trainer = actor_args.trainer_handle
+    if trainer is None:
+        return
+    if not any(owner is trainer for owner in _PRESERVED_TQ_OWNERS):
+        _PRESERVED_TQ_OWNERS.append(trainer)
+
+    preserve = getattr(trainer, "preserve_data_plane_on_shutdown", None)
+    if preserve is not None:
+        preserve(reason)
 
 
 def _run_with_controller_liveness_watch(
@@ -197,29 +273,75 @@ def _run_with_controller_liveness_watch(
     run_ref = sc.run.remote()
     last_pong_at = time.monotonic()
 
-    while True:
-        ready, _ = ray.wait([run_ref], timeout=watchdog_config.interval_s)
-        if ready:
-            return ray.get(run_ref)
+    try:
+        while True:
+            ready, _ = ray.wait([run_ref], timeout=watchdog_config.interval_s)
+            if ready:
+                return ray.get(run_ref)
+
+            try:
+                ray.get(sc.ping.remote(), timeout=watchdog_config.interval_s)
+            except Exception as error:
+                unresponsive_s = time.monotonic() - last_pong_at
+                print(
+                    f"SingleController ping failed after {unresponsive_s:.0f}s "
+                    f"unresponsive: {type(error).__name__}: {error}",
+                    flush=True,
+                )
+                if unresponsive_s > watchdog_config.stall_timeout_s:
+                    raise RuntimeError(
+                        "SingleController event loop has been unresponsive for "
+                        f"{unresponsive_s:.0f}s (stall_timeout_s="
+                        f"{watchdog_config.stall_timeout_s}); its in-actor watchdog "
+                        "runs on that loop and cannot report this."
+                    ) from error
+            else:
+                last_pong_at = time.monotonic()
+    except BaseException:
+        _cancel_and_drain_controller_run(sc, run_ref)
+        raise
+
+
+def _cancel_and_drain_controller_run(
+    sc: ray.actor.ActorHandle, run_ref: ray.ObjectRef
+) -> None:
+    """Stop ``sc.run`` before the driver tears down attached TQ resources."""
+    try:
+        # SingleControllerActor is async, so Ray maps this to asyncio task
+        # cancellation and lets run() execute its cancellation-safe finally.
+        ray.cancel(run_ref)
+    except Exception as error:
+        print(f"SingleController run cancellation request failed: {error}", flush=True)
+
+    try:
+        ray.get(run_ref, timeout=_SHUTDOWN_TIMEOUT_S)
+    except ray.exceptions.GetTimeoutError:
+        # A blocked actor event loop cannot accept graceful cancellation. Kill
+        # it before any driver-side worker or bootstrap TQ owner is shut down.
+        try:
+            ray.kill(sc)
+        except Exception as error:
+            raise _ControllerTerminationError(
+                "SingleController force-kill failed; dependent resources must "
+                "remain alive"
+            ) from error
 
         try:
-            ray.get(sc.ping.remote(), timeout=watchdog_config.interval_s)
-        except Exception as error:
-            unresponsive_s = time.monotonic() - last_pong_at
-            print(
-                f"SingleController ping failed after {unresponsive_s:.0f}s "
-                f"unresponsive: {type(error).__name__}: {error}",
-                flush=True,
-            )
-            if unresponsive_s > watchdog_config.stall_timeout_s:
-                raise RuntimeError(
-                    "SingleController event loop has been unresponsive for "
-                    f"{unresponsive_s:.0f}s (stall_timeout_s="
-                    f"{watchdog_config.stall_timeout_s}); its in-actor watchdog runs "
-                    "on that loop and cannot report this."
-                ) from error
-        else:
-            last_pong_at = time.monotonic()
+            # ray.kill submits the forceful termination. Prove the original run
+            # reference became terminal before releasing dependent resources.
+            ray.get(run_ref, timeout=_SHUTDOWN_TIMEOUT_S)
+        except ray.exceptions.GetTimeoutError as error:
+            raise _ControllerTerminationError(
+                "SingleController run remained nonterminal after force-kill; "
+                "dependent resources must remain alive"
+            ) from error
+        except Exception:
+            # RayActorError (or the run's terminal error) proves the task ended.
+            pass
+    except Exception:
+        # TaskCancelledError, RayActorError, or the run's original exception all
+        # mean the actor task is terminal and its finally has finished.
+        pass
 
 
 if __name__ == "__main__":

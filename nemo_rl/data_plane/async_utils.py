@@ -20,6 +20,40 @@ import asyncio
 from typing import Any
 
 
+async def drain_task_until_done(task: asyncio.Future[Any]) -> bool:
+    """Wait for ``task`` to finish without letting caller cancellation detach it.
+
+    ``asyncio.shield`` protects a child from one cancellation, but the await used
+    to drain that child can itself be cancelled again. Keep shielding until the
+    child is actually done. Child exceptions are observed here and remain
+    available through ``task.result()`` to callers that need to propagate them.
+
+    Returns:
+        True when at least one cancellation of the waiting task was deferred.
+    """
+    cancellation_deferred = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A shielded child is not cancelled when its waiter is cancelled.
+            # If the child cancelled itself, it is already terminal; otherwise
+            # this was another cancellation of the waiter and must be deferred.
+            if task.cancelled():
+                break
+            cancellation_deferred = True
+        except BaseException:
+            # The await observes the child exception. The caller can inspect or
+            # re-raise it with task.result() after this helper returns.
+            break
+
+    if task.done() and not task.cancelled():
+        # Also observe a result/exception when the task completed between the
+        # loop condition and the shielded await.
+        task.exception()
+    return cancellation_deferred
+
+
 async def call_data_plane(
     client: Any,
     method_name: str,
@@ -48,7 +82,26 @@ async def call_data_plane(
     if remote is not None:
         return await remote(**kwargs)
     if offload_sync:
-        result = await asyncio.to_thread(method, **kwargs)
+        # Cancelling an asyncio.to_thread await does not stop its worker
+        # thread. Side-effecting data-plane operations (notably Mooncake save
+        # and durability-fenced clear) must finish before their process-local
+        # TQ client can be torn down, so preserve cancellation while draining
+        # the actual synchronous call.
+        async def _run_offloaded() -> Any:
+            offloaded_result = await asyncio.to_thread(method, **kwargs)
+            if asyncio.iscoroutine(offloaded_result):
+                return await offloaded_result
+            return offloaded_result
+
+        offloaded_call = asyncio.create_task(
+            _run_offloaded(),
+            name=f"data-plane-{method_name}",
+        )
+        try:
+            result = await asyncio.shield(offloaded_call)
+        except asyncio.CancelledError:
+            await drain_task_until_done(offloaded_call)
+            raise
     else:
         result = method(**kwargs)
     if asyncio.iscoroutine(result):
