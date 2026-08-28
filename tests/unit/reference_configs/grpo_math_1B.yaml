@@ -533,6 +533,8 @@ data_plane:
     local_buffer_size:    4294967296 # 4 GiB/process
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
     staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
+    use_gdr: false
+    gdr_staging_buffer_mb: 1024
     checkpoint:
       enabled: false
       storage_root: null

@@ -559,6 +559,8 @@ data_plane:
     local_buffer_size:    4294967296 # 4 GiB/process
     reuse_registered_buffers: true   # reuse RDMA-registered buffers
     staging_buffer_size:   268435456 # 256 MiB/pool slot; bigger transfers bypass the pool
+    use_gdr: false                    # enable TQ's CUDA staging path per GPU client
+    gdr_staging_buffer_mb: 1024       # GPU staging capacity; separate from the CPU pool
     checkpoint:                         # experimental; live writes plus checkpoint-copy I/O on Lustre
       enabled: false
       storage_root: null                # absolute shared-filesystem path when enabled
