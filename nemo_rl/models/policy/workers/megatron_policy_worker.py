@@ -2882,6 +2882,7 @@ class MegatronPolicyWorkerImpl(
         payload: str,
         payload_dtype: str,
         micro_batch_size: Optional[int] = None,
+        keep_payload_on_gpu: bool = False,
     ) -> BatchedDataDict[TeacherFullPayloadOutputSpec]:
         """Run a teacher forward returning sampled-token logprobs and the full payload.
 
@@ -2899,11 +2900,14 @@ class MegatronPolicyWorkerImpl(
             payload: ``"hidden_states"`` or ``"logits"``.
             payload_dtype: Torch dtype name for the transported payload.
             micro_batch_size: Overrides the configured logprob batch size.
+            keep_payload_on_gpu: Keep the payload on this GPU instead of copying
+                each microbatch's share to CPU during the forward.
 
         Returns:
             A BatchedDataDict with ``logprobs`` ``[B, S]`` on every rank and
-            ``teacher_full_payload`` ``[B, S, D]`` on CPU on the last pipeline
-            stage (``None`` elsewhere).
+            ``teacher_full_payload`` ``[B, S, D]`` on the last pipeline stage
+            (``None`` elsewhere): on this GPU if ``keep_payload_on_gpu``, else
+            on CPU.
 
         Raises:
             ValueError: If ``payload`` is ``"hidden_states"`` but this teacher
@@ -2970,6 +2974,7 @@ class MegatronPolicyWorkerImpl(
                 cfg=self.cfg,
                 payload=payload,
                 payload_dtype=getattr(torch, payload_dtype),
+                keep_payload_on_gpu=keep_payload_on_gpu,
                 sampling_params=self.sampling_params,
             ),
             forward_only=True,
@@ -2987,9 +2992,9 @@ class MegatronPolicyWorkerImpl(
                     [o["logprobs"] for o in list_of_outputs], target_len=seq_length
                 )
             }
-            # Already on CPU: the post-processor moves each microbatch off the
-            # device as it is produced, so this pad-and-concatenate never puts
-            # the payload back on the GPU.
+            # Unless keep_payload_on_gpu, already on CPU: the post-processor
+            # moves each microbatch off the device as it is produced, so this
+            # pad-and-concatenate never puts the payload back on the GPU.
             teacher_full_payload = pad_and_concat(
                 [o["teacher_full_payload"] for o in list_of_outputs],
                 target_len=seq_length,

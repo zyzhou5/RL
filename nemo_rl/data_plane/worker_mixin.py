@@ -1112,6 +1112,7 @@ class TQWorkerMixin:
         micro_batch_size: Optional[int] = None,
         opd_full_payload: Optional[str] = None,
         opd_full_payload_dtype: Optional[str] = None,
+        opd_full_payload_on_gpu: bool = False,
         opd_full_payload_field: Optional[str] = None,
         opd_full_teacher_index: Optional[int] = None,
         opd_full_teacher_index_field: Optional[str] = None,
@@ -1124,6 +1125,10 @@ class TQWorkerMixin:
             opd_full_payload: When set (``"hidden_states"`` or ``"logits"``), also
                 emit the full-vocabulary teacher payload from the same forward.
             opd_full_payload_dtype: Torch dtype name for that payload.
+            opd_full_payload_on_gpu: Keep the payload on this rank's GPU until
+                the data-plane PUT instead of copying it to CPU during the
+                forward. The driver sets it only for the hidden-state payload on
+                a GDR data plane (``gdr_keep_teacher_payload_on_gpu``).
             opd_full_payload_field: Data-plane column the payload is written to.
             opd_full_teacher_index: This teacher group's stable index (see
                 ``create_teacher_worker_groups``), tagged onto every row this
@@ -1185,13 +1190,17 @@ class TQWorkerMixin:
                 payload=opd_full_payload,
                 payload_dtype=opd_full_payload_dtype,
                 micro_batch_size=micro_batch_size,
+                keep_payload_on_gpu=opd_full_payload_on_gpu,
             )
             # None off the last pipeline stage, which is what keeps this to a
             # single writer: the payload never leaves the stage that produced it.
             teacher_full_payload = result.get("teacher_full_payload")
             if teacher_full_payload is not None:
+                # On GPU when opd_full_payload_on_gpu is set: the GDR PUT copies
+                # it straight into TQ's staging buffer, and TQ synchronizes this
+                # device before it reads.
                 stage_local_fields = {
-                    opd_full_payload_field: teacher_full_payload.detach().cpu()
+                    opd_full_payload_field: teacher_full_payload.detach()
                 }
                 if opd_full_teacher_index_field is not None:
                     # Guarded above: a column without an index already raised,
@@ -1204,6 +1213,7 @@ class TQWorkerMixin:
                         (teacher_full_payload.shape[0],),
                         int(opd_full_teacher_index),
                         dtype=torch.int64,
+                        device=teacher_full_payload.device,
                     )
                 self._write_back_stage_local(meta, stage_local_fields)
             del teacher_full_payload

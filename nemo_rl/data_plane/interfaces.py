@@ -151,6 +151,16 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     HBM capacity of that buffer per active GDR client. CPU-only clients keep
     using the registered host-buffer path.
 
+    ``gdr_keep_teacher_payload_on_gpu`` only matters for full-vocabulary MOPD
+    with ``teacher_payload: hidden_states`` and ``use_gdr: true``. When true,
+    each teacher keeps its hidden-state payload on the GPU until the data-plane
+    PUT, which then copies it GPU to GPU into the GDR staging buffer instead of
+    GPU -> CPU -> GPU. The cost is teacher GPU memory: each teacher holds its
+    share of one prompt group's payload (rows x tokens x 2 x hidden size bytes)
+    until the PUT. Set it to false to copy the payload to CPU during the forward
+    instead, which was the behavior before this option. It is ignored without
+    ``use_gdr`` and for the ``logits`` payload, which always goes through CPU.
+
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
     That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
     transfer's peer rail to the local one by name; on a rail-isolated RoCE
@@ -169,6 +179,7 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     staging_buffer_size: int = 536870912  # 512 MiB per pool slot
     use_gdr: bool = False
     gdr_staging_buffer_mb: PositiveInt = 1024
+    gdr_keep_teacher_payload_on_gpu: bool = True
     # >0: only CPU MooncakeStorageUnit actors own Mooncake memory (this many
     # bytes each); every other process is a client and off the save path.
     storage_unit_segment_size: NonNegativeInt = 0
