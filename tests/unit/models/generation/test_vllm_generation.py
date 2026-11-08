@@ -1435,9 +1435,8 @@ async def test_only_trained_agents_calls_must_match_the_policy_sampling(
     )
 
     if gym_sampling_header is None:
-        with pytest.raises(
-            AssertionError, match="Top k" if top_k else "matches neither"
-        ):
+        # RL main's check_sampling_param rejects the profile mismatch before top_k.
+        with pytest.raises(ValueError, match="matches neither"):
             await chat_handler(request, raw_request)
         assert reached == []
     else:

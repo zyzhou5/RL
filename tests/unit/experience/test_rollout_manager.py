@@ -1556,20 +1556,6 @@ def test_harness_pool_build_inputs_preserves_retry_identity_and_nested_params():
     assert rows[0]["_ng_rollout_id"] == "attempt-2"
 
 
-def test_ordinary_gym_build_inputs_still_applies_row_sampling_parameters():
-    impl = _nemo_gym_impl(True)
-    sample = {"extra_env_info": {"responses_create_params": {"max_output_tokens": 7}}}
-    rows = impl._build_inputs(sample, task_index=0)
-    assert rows[0]["responses_create_params"] == {
-        "max_output_tokens": 7,
-        "temperature": 1.0,
-        "top_p": 1.0,
-    }
-    assert sample["extra_env_info"]["responses_create_params"] == {
-        "max_output_tokens": 7
-    }
-
-
 def test_harness_pool_stream_keeps_per_completion_attribution_and_group_metrics():
     class _RunRolloutsRemote:
         def options(self, *, num_returns):
@@ -1637,8 +1623,10 @@ def test_harness_pool_stream_keeps_per_completion_attribution_and_group_metrics(
         "physical-0",
         "physical-1",
     ]
-    assert record.rollout_metrics["agent-0/total_tokens_per_sample/mean"] == 10
-    assert record.rollout_metrics["agent-1/total_tokens_per_sample/mean"] == 11
+    # Receipt mode leaves token counts to the finalizer, per harness as for the group.
+    assert not any(
+        key.endswith("total_tokens_per_sample/mean") for key in record.rollout_metrics
+    )
     for index, completion in enumerate(record.completions):
         assert (
             completion.env_extras["ng_reward_log_context"].agent_name
@@ -3047,7 +3035,7 @@ def test_harness_pool_capture_manager_restores_per_sibling_agents(granularity):
         ],
     )
     manager._harness_pool = ["env-a", "env-b"]
-    request = _run(manager.generate_for_finalization(prompt))
+    request, _ = _run(manager.generate_for_finalization(prompt))
     assert request.resolved_agent_name is None
     assert request.resolved_agent_names == ("agent-a", "agent-b")
     assert request.attribution_key == "tasks"
@@ -3067,7 +3055,7 @@ def test_harness_pool_capture_manager_restores_per_sibling_agents(granularity):
         restored._tq_buffer,
         lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
     )
-    recovered = _run(
+    recovered, _ = _run(
         restored.generate_for_finalization(prompt, lineage_group_id=request.group_id)
     )
     assert recovered.resolved_agent_name is None

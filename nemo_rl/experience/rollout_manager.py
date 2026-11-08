@@ -2087,15 +2087,16 @@ class AsyncNemoGymRolloutImpl:
                         calculate_single_metric(values, count, f"{name}/{key}")
                     )
 
-            # Live token counts take precedence over similarly named metadata.
-            rollout_metrics.update(
-                calculate_single_metric(
-                    [total_tokens[index] for index in indices],
-                    count,
-                    f"{name}/total_tokens_per_sample",
-                )
-            )
+            # Live token counts take precedence over similarly named metadata. Receipt
+            # mode reports token counts from the finalizer instead.
             if not receipt_mode:
+                rollout_metrics.update(
+                    calculate_single_metric(
+                        [total_tokens[index] for index in indices],
+                        count,
+                        f"{name}/total_tokens_per_sample",
+                    )
+                )
                 rollout_metrics.update(
                     calculate_single_metric(
                         [assistant_tokens[index] for index in indices],
@@ -2112,11 +2113,6 @@ class AsyncNemoGymRolloutImpl:
         # Emit authoritative live token metrics after full-result metrics so
         # similarly named environment metadata cannot overwrite them.
         if not receipt_mode:
-            rollout_metrics.update(
-                calculate_single_metric(
-                    total_tokens, n, f"{agent_name}/total_tokens_per_sample"
-                )
-            )
             rollout_metrics.update(
                 calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample")
             )

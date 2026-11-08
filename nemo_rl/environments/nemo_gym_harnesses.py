@@ -27,7 +27,6 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
 
-
 HarnessPool = tuple["HarnessRoute", ...]
 
 
