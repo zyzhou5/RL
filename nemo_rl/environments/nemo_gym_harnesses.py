@@ -28,19 +28,22 @@ from nemo_rl.experience.interfaces import (
 )
 
 
+HarnessPool = tuple["HarnessRoute", ...]
+
+
 @dataclass(frozen=True)
 class HarnessRoute:
-    """One resolved Gym environment and the agent/resources pair it owns."""
+    """One resolved Gym environment, the agent it binds, and the resources server it shares.
+
+    A Harbor environment grades with its tasks' own verifiers, so it names no resources server.
+    """
 
     environment_name: str
     agent_name: str
-    resources_name: str
+    resources_name: str | None
 
 
-def parse_harness_pool(value: object) -> list[str] | None:
-    """Validate the optional ordered list of Gym environment names."""
-    if value is None:
-        return None
+def _parse_names(value: object) -> list[str]:
     if (
         not isinstance(value, list)
         or not value
@@ -53,43 +56,92 @@ def parse_harness_pool(value: object) -> list[str] | None:
     return list(value)
 
 
+def parse_harness_pool(value: object) -> list[str] | dict[str, list[str]] | None:
+    """Validate the optional pool: one ordered list for every taskset, or one list per taskset."""
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        if not value or any(
+            not isinstance(taskset, str) or not taskset.strip() for taskset in value
+        ):
+            raise ValueError(
+                "env.nemo_gym.harness_pool must map nonempty taskset names to environment lists"
+            )
+        return {taskset: _parse_names(names) for taskset, names in value.items()}
+    return _parse_names(value)
+
+
 def resolve_harness_pool(
-    names: list[str], global_config: Mapping[str, Any]
-) -> tuple[HarnessRoute, ...]:
-    """Resolve a pool of single-agent environments sharing one resources server.
+    names: list[str],
+    global_config: Mapping[str, Any],
+    *,
+    taskset: str | None = None,
+) -> HarnessPool:
+    """Resolve a pool of environments that differ only in their harness.
+
+    Single-agent environments must share one resources server and verifier. Harbor environments
+    must serve the same tasksets, or, for a pool of one taskset, each serve that taskset.
 
     Args:
         names: Ordered, distinct environment instance names.
         global_config: Gym's resolved global configuration.
+        taskset: The taskset this pool serves, or None for a pool that serves every taskset.
 
     Returns:
         Validated routes in the configured order.
     """
-    parse_harness_pool(names)
+    _parse_names(names)
     routes = []
+    kinds = set()
+    harbor_tasksets = set()
     for name in names:
         entry = global_config.get(name, {})
         servers = entry.get("environment_servers", {})
-        if set(servers) != {"single_agent_turn"}:
+        if set(servers) not in ({"single_agent_turn"}, {"harbor"}):
             raise ValueError(
-                f"Harness environment {name!r} must use typed single_agent_turn"
+                f"Harness environment {name!r} must use typed single_agent_turn or harbor"
             )
-        config = servers["single_agent_turn"]
+        kind = next(iter(servers))
+        kinds.add(kind)
+        config = servers[kind]
         if config.get("agent_server_pool") is not None:
             raise ValueError(
                 f"Harness environment {name!r} must bind exactly one agent"
             )
         agent = config.get("agent_server") or {}
-        resources = config.get("resources_server") or {}
-        if (
-            agent.get("type") != "responses_api_agents"
-            or resources.get("type") != "resources_servers"
-        ):
+        if agent.get("type") != "responses_api_agents":
             raise ValueError(
                 f"Harness environment {name!r} has invalid agent/resources references"
             )
-        agent_name, resources_name = agent.get("name"), resources.get("name")
-        if not isinstance(agent_name, str) or not isinstance(resources_name, str):
+        resources_name = None
+        if kind == "single_agent_turn":
+            resources = config.get("resources_server") or {}
+            if resources.get("type") != "resources_servers":
+                raise ValueError(
+                    f"Harness environment {name!r} has invalid agent/resources references"
+                )
+            resources_name = resources.get("name")
+            if not isinstance(resources_name, str):
+                raise ValueError(
+                    f"Harness environment {name!r} must name its agent and resources server"
+                )
+            if not global_config.get(resources_name, {}).get("resources_servers"):
+                raise ValueError(
+                    f"Harness environment {name!r} references missing resources {resources_name!r}"
+                )
+        else:
+            served = config.get("tasksets") or {}
+            if not isinstance(served, Mapping) or not served:
+                raise ValueError(
+                    f"Harness environment {name!r} must serve at least one taskset"
+                )
+            if taskset is not None and taskset not in served:
+                raise ValueError(
+                    f"Harness environment {name!r} does not serve taskset {taskset!r}"
+                )
+            harbor_tasksets.add(frozenset(served))
+        agent_name = agent.get("name")
+        if not isinstance(agent_name, str):
             raise ValueError(
                 f"Harness environment {name!r} must name its agent and resources server"
             )
@@ -108,18 +160,36 @@ def resolve_harness_pool(
                 f"Harness agent {agent_name!r} must have exactly one configuration "
                 "using model_server responses_api_models:policy_model for training capture"
             )
-        if not global_config.get(resources_name, {}).get("resources_servers"):
-            raise ValueError(
-                f"Harness environment {name!r} references missing resources {resources_name!r}"
-            )
         routes.append(HarnessRoute(name, agent_name, resources_name))
-    if len({route.resources_name for route in routes}) != 1:
+    if len(kinds) != 1:
         raise ValueError(
-            "Harness environments must share one resources server and verifier"
+            "Harness environments must all use single_agent_turn or all use harbor"
         )
+    if kinds == {"single_agent_turn"}:
+        if len({route.resources_name for route in routes}) != 1:
+            raise ValueError(
+                "Harness environments must share one resources server and verifier"
+            )
+    elif taskset is None and len(harbor_tasksets) != 1:
+        raise ValueError("Harbor harness environments must serve the same tasksets")
     if len({route.agent_name for route in routes}) != len(routes):
         raise ValueError("Harness environments must bind distinct agent instances")
     return tuple(routes)
+
+
+def resolve_harness_pools(
+    pool: list[str] | dict[str, list[str]], global_config: Mapping[str, Any]
+) -> dict[str | None, HarnessPool]:
+    """Resolve a list pool, or one pool per taskset, keyed by taskset (None serves every taskset)."""
+    parsed = parse_harness_pool(pool)
+    if parsed is None:
+        raise ValueError("Harness routing requires a nonempty resolved pool")
+    if isinstance(parsed, list):
+        return {None: resolve_harness_pool(parsed, global_config)}
+    return {
+        taskset: resolve_harness_pool(names, global_config, taskset=taskset)
+        for taskset, names in parsed.items()
+    }
 
 
 def responses_create_params(row: dict[str, Any]) -> dict[str, Any]:
@@ -131,7 +201,8 @@ def responses_create_params(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def route_harness_rows(
-    rows: list[dict[str, Any]], routes: tuple[HarnessRoute, ...]
+    rows: list[dict[str, Any]],
+    routes: HarnessPool | Mapping[str | None, HarnessPool],
 ) -> None:
     """Stamp per-rollout destinations using durable identity, never physical attempts.
 
@@ -139,7 +210,8 @@ def route_harness_rows(
     survives sibling retries, while the capture ID can change on each attempt.
     Pool order must remain fixed when resuming a training run.
     """
-    if not routes:
+    pools = routes if isinstance(routes, Mapping) else {None: routes}
+    if not pools or not all(pools.values()):
         raise ValueError("Harness routing requires a nonempty resolved pool")
     for row in rows:
         task = row.get("task_id")
@@ -169,15 +241,19 @@ def route_harness_rows(
         digest = hashlib.sha256(
             json.dumps(key, ensure_ascii=False, separators=(",", ":")).encode()
         ).digest()
-        route = routes[int.from_bytes(digest, "big") % len(routes)]
-        source = row.get("task_source")
-        if source is not None and source != route.resources_name:
-            raise ValueError(
-                f"Task source {source!r} does not match harness resources {route.resources_name!r}"
-            )
+        pool = pools.get(taskset, pools.get(None))
+        if pool is None:
+            raise ValueError(f"No harness pool serves taskset {taskset!r}")
+        route = pool[int.from_bytes(digest, "big") % len(pool)]
+        if route.resources_name is not None:
+            source = row.get("task_source")
+            if source is not None and source != route.resources_name:
+                raise ValueError(
+                    f"Task source {source!r} does not match harness resources {route.resources_name!r}"
+                )
+            row["task_source"] = route.resources_name
         row["_ng_environment_server"] = route.environment_name
         row["agent_ref"] = {"type": "responses_api_agents", "name": route.agent_name}
-        row["task_source"] = route.resources_name
 
 
 def attribute_harness_result(

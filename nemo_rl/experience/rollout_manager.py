@@ -1046,7 +1046,7 @@ class AsyncNemoGymRolloutImpl:
         log_full_result_tables: bool = False,
         forest_training: bool = False,
         *,
-        harness_pool: Optional[list[str]] = None,
+        harness_pool: Optional[list[str] | dict[str, list[str]]] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -2224,7 +2224,7 @@ class RolloutManager:
         forest_training: bool = False,
         execution_row_multiple: int = 1,
         *,
-        harness_pool: Optional[list[str]] = None,
+        harness_pool: Optional[list[str] | dict[str, list[str]]] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"

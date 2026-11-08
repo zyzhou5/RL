@@ -108,9 +108,15 @@ An Environment Server can report a failed episode as terminal, meaning a retry c
 
 SingleController GRPO can choose a session harness independently for each
 generation of a typed Gym task. Set `env.nemo_gym.harness_pool` to an ordered
-list of **environment instance names**. Each instance must use Gym's typed
-`single_agent_turn` server, bind a distinct agent, and share the same resources
-server/verifier. Gym owns sandbox/session creation and cleanup as usual.
+list of **environment instance names**. Each instance must bind a distinct agent
+and use either Gym's typed `single_agent_turn` server, sharing the same resources
+server/verifier, or the `harbor` server, serving the same tasksets. Gym owns
+sandbox/session creation and cleanup as usual.
+
+When a dataset's tasksets use different resources servers, such as one taskset
+per SWE source, map each taskset to its own pool instead:
+`harness_pool: {scale_swe: [scale_swe_opencode, scale_swe_pi], swe_rebench:
+[swe_rebench_opencode, swe_rebench_pi]}`. Every row's taskset must have a pool.
 
 This initial path requires `token_capture.enabled: true`, one unsharded Gym
 actor, and text tasks. Ordinary GRPO, distillation/teacher routing, and VLM

@@ -81,7 +81,7 @@ from nemo_rl.environments.nemo_gym_harnesses import (
     HarnessRoute,
     attribute_harness_result,
     parse_harness_pool,
-    resolve_harness_pool,
+    resolve_harness_pools,
     route_harness_rows,
 )
 from nemo_rl.environments.nemo_gym_multimodal import (
@@ -736,8 +736,9 @@ class NemoGymConfig(TypedDict):
     # server, switches run_rollouts to receipt mode, and assembles receipts
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
-    # Ordered typed Environment instances; consumed by RL, not Gym global config.
-    harness_pool: NotRequired[list[str] | None]
+    # Ordered typed Environment instances, for every taskset or per taskset; consumed by RL,
+    # not Gym global config.
+    harness_pool: NotRequired[list[str] | dict[str, list[str]] | None]
     # Internal checkpoint topology. These are derived by the actor builder,
     # never read from user YAML.
     checkpoint_instance: GymCheckpointInstance
@@ -1181,7 +1182,7 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
-        self._harness_routes: tuple[HarnessRoute, ...] = ()
+        self._harness_routes: dict[str | None, tuple[HarnessRoute, ...]] = {}
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -1448,7 +1449,7 @@ Depending on your data shape, you may want to change these values."""
                             "Gym global configuration keys must be strings"
                         )
                     resolved_config[key] = value
-                self._harness_routes = resolve_harness_pool(
+                self._harness_routes = resolve_harness_pools(
                     harness_pool, resolved_config
                 )
             _wait_for_external_services(self.cfg.get("external_service_readiness"))

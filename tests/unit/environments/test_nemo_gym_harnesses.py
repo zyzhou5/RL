@@ -26,6 +26,7 @@ from nemo_rl.environments.nemo_gym_harnesses import (
     attribute_harness_result,
     parse_harness_pool,
     resolve_harness_pool,
+    resolve_harness_pools,
     responses_create_params,
     route_harness_rows,
 )
@@ -164,6 +165,96 @@ def test_pool_rejects_multiple_agent_configurations():
     agents["another_agent"] = copy.deepcopy(agents["pi_agent"])
     with pytest.raises(ValueError, match="exactly one configuration"):
         resolve_harness_pool([route.environment_name for route in ROUTES], config)
+
+
+HARBOR = ["harbor_opencode_agent", "harbor_pi_agent"]
+
+
+def harbor_config(tasksets=("smoke",)):
+    config = resolved_config()
+    for route in ROUTES:
+        config[f"harbor_{route.agent_name}"] = {
+            "environment_servers": {
+                "harbor": {
+                    "agent_server": {
+                        "type": "responses_api_agents",
+                        "name": route.agent_name,
+                    },
+                    "tasksets": {name: {"path": f"/data/{name}"} for name in tasksets},
+                }
+            }
+        }
+    return config
+
+
+@pytest.mark.parametrize("value", [{}, {"": ["swe_pi"]}, {"smoke": []}])
+def test_per_taskset_pool_rejects_invalid_mappings(value):
+    with pytest.raises(ValueError, match="taskset names|nonempty list"):
+        parse_harness_pool(value)
+
+
+def test_harbor_pool_routes_without_a_resources_server():
+    routes = resolve_harness_pool(HARBOR, harbor_config())
+    assert routes == (
+        HarnessRoute("harbor_opencode_agent", "opencode_agent", None),
+        HarnessRoute("harbor_pi_agent", "pi_agent", None),
+    )
+    rows = [task(i) for i in range(16)]
+    route_harness_rows(rows, routes)
+    assert {row["_ng_environment_server"] for row in rows} == set(HARBOR)
+    assert {row["agent_ref"]["name"] for row in rows} == {"opencode_agent", "pi_agent"}
+    # Harbor tasks grade with their own verifiers, so no resources server is stamped.
+    assert all("task_source" not in row for row in rows)
+
+
+def test_harbor_pool_rejects_mismatched_tasksets_and_mixed_environment_types():
+    config = harbor_config()
+    config["harbor_pi_agent"]["environment_servers"]["harbor"]["tasksets"] = {
+        "other": {}
+    }
+    with pytest.raises(ValueError, match="serve the same tasksets"):
+        resolve_harness_pool(HARBOR, config)
+    with pytest.raises(ValueError, match="all use single_agent_turn or all use harbor"):
+        resolve_harness_pool(["swe_opencode", "harbor_pi_agent"], harbor_config())
+
+
+def test_per_taskset_pools_send_each_source_to_its_own_resources_server():
+    config = resolved_config()
+    config["rebench"] = {"resources_servers": {"swe_rebench": {}}}
+    for route in ROUTES:
+        environment = copy.deepcopy(config[route.environment_name])
+        environment["environment_servers"]["single_agent_turn"]["resources_server"][
+            "name"
+        ] = "rebench"
+        config[f"rebench_{route.environment_name}"] = environment
+    pools = resolve_harness_pools(
+        {
+            "scale": ["swe_opencode", "swe_pi"],
+            "rebench": ["rebench_swe_opencode", "rebench_swe_pi"],
+        },
+        config,
+    )
+    rows = [task(i) for i in range(8)]
+    for index, row in enumerate(rows):
+        row["task_id"]["taskset"] = "scale" if index < 4 else "rebench"
+    route_harness_rows(rows, pools)
+    assert {row["task_source"] for row in rows[:4]} == {"swe"}
+    assert {row["task_source"] for row in rows[4:]} == {"rebench"}
+    assert {row["_ng_environment_server"] for row in rows[4:]} <= {
+        "rebench_swe_opencode",
+        "rebench_swe_pi",
+    }
+    unlisted = task()
+    unlisted["task_id"]["taskset"] = "unlisted"
+    with pytest.raises(ValueError, match="No harness pool serves taskset 'unlisted'"):
+        route_harness_rows([unlisted], pools)
+
+
+def test_per_taskset_harbor_pool_requires_each_environment_to_serve_its_taskset():
+    with pytest.raises(ValueError, match="does not serve taskset 'missing'"):
+        resolve_harness_pools({"missing": HARBOR}, harbor_config())
+    pools = resolve_harness_pools({"smoke": HARBOR}, harbor_config(("smoke", "other")))
+    assert [route.environment_name for route in pools["smoke"]] == HARBOR
 
 
 def test_hash_covers_harnesses_and_is_stable_on_sibling_retry():
